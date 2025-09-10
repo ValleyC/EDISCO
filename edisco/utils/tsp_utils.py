@@ -40,16 +40,16 @@ def batched_two_opt_torch(points, tours, max_iterations=1000, device="cpu"):
     iterator = 0
     
     with torch.no_grad():
-        # Convert to torch tensors
+        # Convert to torch tensors - FIX: explicitly convert to long (int64)
         cuda_points = torch.from_numpy(points).to(device)
-        cuda_tours = torch.from_numpy(tours).to(device)
+        cuda_tours = torch.from_numpy(tours).long().to(device)  # Added .long() for int64
         
         min_change = -1.0
         while min_change < 0.0 and iterator < max_iterations:
             # Get tour points
             tour_points = cuda_points.gather(
                 1, 
-                cuda_tours.unsqueeze(-1).expand(-1, -1, 2)
+                cuda_tours.unsqueeze(-1).expand(-1, -1, 2).long()  # Ensure long dtype
             )
             
             # Compute all pairwise improvements
@@ -216,7 +216,7 @@ def edges_to_tour(tour_edges, n_nodes):
         prev = current
         current = next_node
     
-    return np.array(tour)
+    return np.array(tour, dtype=np.int64)  # Ensure int64 dtype
 
 
 def nearest_neighbor_tour(coords):
@@ -252,7 +252,7 @@ def nearest_neighbor_tour(coords):
         unvisited.remove(nearest)
         current = nearest
     
-    return np.array(tour)
+    return np.array(tour, dtype=np.int64)  # Ensure int64 dtype
 
 
 def compute_tour_length(coords, tour):
@@ -270,6 +270,9 @@ def compute_tour_length(coords, tour):
         coords = coords.numpy()
     if torch.is_tensor(tour):
         tour = tour.numpy()
+    
+    # Ensure tour is int64
+    tour = tour.astype(np.int64)
     
     length = 0.0
     n = len(tour)
@@ -316,6 +319,9 @@ class TSPEvaluator:
         if torch.is_tensor(tour):
             tour = tour.numpy()
         
+        # Ensure tour is int64
+        tour = tour.astype(np.int64)
+        
         cost = 0.0
         for i in range(len(tour)):
             u = tour[i]
@@ -336,6 +342,9 @@ class TSPEvaluator:
         """
         if torch.is_tensor(tours):
             tours = tours.numpy()
+        
+        # Ensure tours are int64
+        tours = tours.astype(np.int64)
         
         batch_size = tours.shape[0]
         costs = np.zeros(batch_size)

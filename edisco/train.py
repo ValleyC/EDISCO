@@ -25,7 +25,7 @@ def arg_parser():
     parser.add_argument('--validation_examples', type=int, default=64)
 
     # Training arguments
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_epochs', type=int, default=50)
     parser.add_argument('--learning_rate', type=float, default=2e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-5)
@@ -129,7 +129,7 @@ def main(args):
         max_epochs=epochs,
         callbacks=[TQDMProgressBar(refresh_rate=20), checkpoint_callback, lr_callback],
         logger=wandb_logger,
-        check_val_every_n_epoch=1,
+        check_val_every_n_epoch=10,
         strategy=DDPStrategy(static_graph=True) if torch.cuda.device_count() > 1 else 'auto',
         precision=16 if args.fp16 else 32,
         gradient_clip_val=args.gradient_clip_val,
