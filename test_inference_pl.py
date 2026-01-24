@@ -1,0 +1,525 @@
+"""
+Custom EDISCO inference using PyTorch Lightning's load_from_checkpoint.
+This ensures identical configuration to official inference.
+"""
+
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'edisco'))
+
+import torch
+import numpy as np
+import time
+from argparse import Namespace
+
+
+# ============ Pure Python merge_tours ============
+
+def numpy_merge(points, adj_mat):
+    """
+    Pure Python/NumPy implementation of tour merging.
+    Greedy edge insertion based on (probability / distance) ratio.
+    """
+    n = adj_mat.shape[0]
+    dists = np.linalg.norm(points[:, None] - points, axis=-1)
+    dists[dists == 0] = 1e-10
+
+    scores = adj_mat / dists
+
+    parent = list(range(n))
+    rank = [0] * n
+    endpoints = {i: [i, i] for i in range(n)}
+    degree = [0] * n
+
+    def find(x):
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+
+    def union(x, y):
+        px, py = find(x), find(y)
+        if px == py:
+            return False
+        if rank[px] < rank[py]:
+            px, py = py, px
+        parent[py] = px
+        if rank[px] == rank[py]:
+            rank[px] += 1
+        ex, ey = endpoints[px], endpoints[py]
+        new_endpoints = []
+        for e in ex + ey:
+            if e != x and e != y:
+                new_endpoints.append(e)
+        if len(new_endpoints) == 0:
+            new_endpoints = [x, y]
+        elif len(new_endpoints) == 1:
+            new_endpoints = new_endpoints + new_endpoints
+        endpoints[px] = new_endpoints[:2]
+        return True
+
+    real_adj = np.zeros((n, n))
+
+    edges = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            edges.append((scores[i, j], i, j))
+    edges.sort(reverse=True)
+
+    edge_count = 0
+    for score, i, j in edges:
+        if edge_count >= n:
+            break
+
+        if degree[i] >= 2 or degree[j] >= 2:
+            continue
+
+        pi, pj = find(i), find(j)
+
+        if pi == pj:
+            if edge_count == n - 1:
+                real_adj[i, j] = 1
+                real_adj[j, i] = 1
+                edge_count += 1
+            continue
+
+        ei, ej = endpoints[pi], endpoints[pj]
+        if i not in ei or j not in ej:
+            continue
+
+        real_adj[i, j] = 1
+        real_adj[j, i] = 1
+        degree[i] += 1
+        degree[j] += 1
+        union(i, j)
+        edge_count += 1
+
+    return real_adj, edge_count
+
+
+def extract_tour_from_adj(adj_mat):
+    """Extract tour from adjacency matrix."""
+    n = adj_mat.shape[0]
+    tour = [0]
+    visited = {0}
+
+    while len(tour) < n:
+        current = tour[-1]
+        neighbors = np.where(adj_mat[current] > 0)[0]
+
+        next_node = None
+        for nb in neighbors:
+            if nb not in visited:
+                next_node = nb
+                break
+
+        if next_node is None:
+            for i in range(n):
+                if i not in visited:
+                    next_node = i
+                    break
+
+        if next_node is None:
+            break
+
+        tour.append(next_node)
+        visited.add(next_node)
+
+    tour.append(tour[0])
+    return tour
+
+
+def merge_tours_python(adj_probs, coords):
+    """Pure Python merge_tours implementation."""
+    adj_probs = (adj_probs + adj_probs.T) / 2
+    real_adj, _ = numpy_merge(coords, adj_probs)
+    tour = extract_tour_from_adj(real_adj)
+    return tour
+
+
+def compute_tour_cost(coords, tour):
+    """Compute tour cost."""
+    total = 0.0
+    for i in range(len(tour) - 1):
+        total += np.linalg.norm(coords[tour[i]] - coords[tour[i + 1]])
+    return total
+
+
+# ============ Model Loading ============
+
+def create_dummy_args(n_nodes=20):
+    """Create minimal args for model loading."""
+    return Namespace(
+        # Task
+        task='tsp',
+
+        # Data paths (dummy)
+        storage_path='.',
+        training_split='dummy_train.txt',
+        validation_split='dummy_val.txt',
+        test_split='dummy_test.txt',
+        validation_examples=1,
+
+        # Training params
+        batch_size=1,
+        num_epochs=1,
+        learning_rate=1e-4,
+        weight_decay=0.0,
+        lr_scheduler='constant',
+        num_workers=0,
+        fp16=False,
+        use_activation_checkpoint=False,
+
+        # Diffusion
+        diffusion_type='categorical',
+        diffusion_schedule='linear',
+        diffusion_steps=1000,
+        continuous_time=True,
+        equivariant=True,
+        beta_min=0.1,
+        beta_max=1.5,
+
+        # Inference
+        inference_diffusion_steps=1000,
+        inference_schedule='linear',
+        inference_trick='ddim',
+        sequential_sampling=1,
+        parallel_sampling=1,
+
+        # Solver
+        solver_type='pndm',
+        solver_steps=50,
+        time_schedule='linear',
+        adaptive_mixing=True,
+        deterministic_threshold=0.1,
+
+        # Architecture
+        n_layers=12,
+        hidden_dim=256,
+        node_dim=64,
+        edge_dim=64,
+        time_dim=128,
+        coord_dim=2,
+        coord_update_alpha=0.1,
+        weight_temp=10.0,
+
+        # Graph
+        sparse_factor=0,  # Dense mode
+        aggregation='sum',
+        two_opt_iterations=0,
+        save_numpy_heatmap=False,
+
+        # CVRP (not used but required)
+        merge_routes=False,
+
+        # Logging (not used)
+        project_name='edisco_test',
+        wandb_entity=None,
+        wandb_logger_name=None,
+        resume_id=None,
+        ckpt_path=None,
+        resume_weight_only=False,
+
+        # Modes
+        do_train=False,
+        do_test=True,
+        do_valid_only=False,
+        compare_solvers=False,
+        test_equivariance=False,
+        disable_continuous_time=False,
+        disable_equivariance=False,
+        force_dense_only=True,
+        disable_optimizations=False,
+
+        # Derived
+        dense_only=True,
+    )
+
+
+def create_dummy_tsp_file(filepath, n_instances=10, n_nodes=20):
+    """Create a minimal dummy TSP file."""
+    os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else '.', exist_ok=True)
+    with open(filepath, 'w') as f:
+        for _ in range(n_instances):
+            coords = ' '.join([f'{np.random.rand():.6f}' for _ in range(n_nodes * 2)])
+            tour = ' '.join([str(i) for i in range(n_nodes)])
+            f.write(f"{coords} output {tour}\n")
+    return filepath
+
+
+def load_model_from_checkpoint(ckpt_path, device='cuda', n_nodes=20):
+    """
+    Load EDISCO model using PyTorch Lightning's load_from_checkpoint.
+    This ensures identical configuration to official inference.
+    """
+    from pl_edisco_model import EDISCOModel
+
+    # Create dummy data files for model initialization
+    dummy_dir = os.path.join(os.path.dirname(ckpt_path), 'dummy_data')
+    os.makedirs(dummy_dir, exist_ok=True)
+
+    dummy_train = os.path.join(dummy_dir, 'train.txt')
+    dummy_val = os.path.join(dummy_dir, 'val.txt')
+    dummy_test = os.path.join(dummy_dir, 'test.txt')
+
+    for f in [dummy_train, dummy_val, dummy_test]:
+        if not os.path.exists(f):
+            create_dummy_tsp_file(f, n_instances=10, n_nodes=n_nodes)
+
+    # Create args
+    args = create_dummy_args(n_nodes)
+    args.storage_path = dummy_dir
+    args.training_split = 'train.txt'
+    args.validation_split = 'val.txt'
+    args.test_split = 'test.txt'
+
+    print(f"Loading model from checkpoint...")
+    print(f"  Checkpoint: {ckpt_path}")
+    print(f"  Args: sparse_factor={args.sparse_factor}, dense_only={args.dense_only}")
+
+    # Load model using PL's load_from_checkpoint
+    model = EDISCOModel.load_from_checkpoint(ckpt_path, param_args=args)
+    model.eval()
+    model.to(device)
+
+    # Freeze all parameters
+    for p in model.parameters():
+        p.requires_grad = False
+
+    print(f"  Model loaded: {model.__class__.__name__}")
+    print(f"  Encoder: {model.model.__class__.__name__}")
+    print(f"  Solver: {model.solver_type} ({model.solver_steps} steps)")
+    print(f"  Dense mode: {model.dense_only}")
+
+    return model
+
+
+# ============ Inference ============
+
+def run_inference_with_model(model, coords, device='cuda'):
+    """
+    Run inference using the loaded model's sample_with_solver method.
+    This is the exact same method used in official inference.
+    """
+    if coords.dim() == 2:
+        coords = coords.unsqueeze(0)
+    coords = coords.to(device)
+
+    with torch.no_grad():
+        tours, adj_probs = model.sample_with_solver(coords, device=device)
+
+    return tours, adj_probs
+
+
+def run_custom_diffusion(model, coords, device='cuda', n_steps=50):
+    """
+    Run diffusion manually using model components.
+    For debugging - should match official inference.
+    """
+    from utils.ode_solvers import get_solver
+    from models.continuous_score_network import ScoreWrapper
+
+    if coords.dim() == 2:
+        coords = coords.unsqueeze(0)
+    coords = coords.to(device)
+
+    batch_size, n_nodes, _ = coords.shape
+
+    # Initialize from noise
+    x_T = torch.randint(0, 2, (batch_size, n_nodes, n_nodes),
+                       device=device, dtype=torch.float32)
+
+    # Use model's score_network and solver settings
+    score_fn = ScoreWrapper(model.score_network, coords, None)
+
+    # Get solver with model's configuration
+    solver = get_solver(
+        model.solver_type,
+        n_steps,
+        beta_min=model.args.beta_min,
+        beta_max=model.args.beta_max
+    )
+
+    # Run solver
+    x0_pred = solver.sample(
+        score_fn, x_T, device=device,
+        schedule=model.time_schedule,
+        adaptive_mixing=model.use_adaptive_mixing,
+        deterministic_threshold=model.deterministic_threshold
+    )
+
+    return x0_pred
+
+
+# ============ Tests ============
+
+def test_single_instance(model, n_nodes=20, device='cuda'):
+    """Test single instance with official inference method."""
+    print(f"\n{'='*60}")
+    print(f"Test 1: Single instance TSP-{n_nodes} (Official Method)")
+    print(f"{'='*60}")
+
+    torch.manual_seed(42)
+    coords = torch.rand(1, n_nodes, 2, device=device)
+    coords_np = coords[0].cpu().numpy()
+
+    # Use official inference method
+    start_time = time.time()
+    tours, adj_probs = run_inference_with_model(model, coords, device)
+    inference_time = time.time() - start_time
+
+    pred_tour = tours[0]
+
+    # Remove closing node if present
+    if len(pred_tour) == n_nodes + 1 and pred_tour[0] == pred_tour[-1]:
+        pred_tour = pred_tour[:-1]
+
+    tour_cost = compute_tour_cost(coords_np, pred_tour + [pred_tour[0]])
+
+    print(f"  Tour: {pred_tour[:10]}... (first 10)")
+    print(f"  Tour length: {len(pred_tour)} nodes")
+    print(f"  Tour cost: {tour_cost:.4f}")
+    print(f"  Inference time: {inference_time:.3f}s")
+
+    # Validate tour
+    if len(pred_tour) == n_nodes and len(set(pred_tour)) == n_nodes:
+        print(f"  Tour valid: Yes")
+    else:
+        print(f"  Tour valid: No (length={len(pred_tour)}, unique={len(set(pred_tour))})")
+
+    return pred_tour, tour_cost
+
+
+def test_custom_vs_official(model, n_nodes=20, device='cuda'):
+    """Compare custom diffusion to official inference."""
+    print(f"\n{'='*60}")
+    print(f"Test 2: Custom diffusion vs Official method")
+    print(f"{'='*60}")
+
+    torch.manual_seed(42)
+    coords = torch.rand(1, n_nodes, 2, device=device)
+    coords_np = coords[0].cpu().numpy()
+
+    # Run custom diffusion
+    print("  Running custom diffusion...")
+    adj_custom = run_custom_diffusion(model, coords, device, n_steps=50)
+    adj_custom_np = adj_custom[0].cpu().numpy()
+    adj_custom_np = (adj_custom_np + adj_custom_np.T) / 2
+
+    n_edges_custom = (adj_custom_np > 0.5).sum() / 2
+    mean_degree_custom = (adj_custom_np > 0.5).sum(axis=1).mean()
+
+    print(f"  Custom: edges={n_edges_custom:.0f}, mean_degree={mean_degree_custom:.2f}")
+
+    # Extract tour
+    tour_custom = merge_tours_python(adj_custom_np, coords_np)
+    if len(tour_custom) == n_nodes + 1:
+        tour_custom = tour_custom[:-1]
+    cost_custom = compute_tour_cost(coords_np, tour_custom + [tour_custom[0]])
+    print(f"  Custom tour cost: {cost_custom:.4f}")
+
+    # Run official inference
+    print("  Running official inference...")
+    torch.manual_seed(42)  # Reset seed for same x_T
+    tours, adj_probs = run_inference_with_model(model, coords, device)
+    pred_tour = tours[0]
+    if len(pred_tour) == n_nodes + 1:
+        pred_tour = pred_tour[:-1]
+    cost_official = compute_tour_cost(coords_np, pred_tour + [pred_tour[0]])
+    print(f"  Official tour cost: {cost_official:.4f}")
+
+    return cost_custom, cost_official
+
+
+def test_many_instances(model, n_nodes=20, n_instances=100, device='cuda'):
+    """Test many instances using official inference."""
+    print(f"\n{'='*60}")
+    print(f"Test 3: {n_instances} instances TSP-{n_nodes} (Official Method)")
+    print(f"{'='*60}")
+
+    torch.manual_seed(0)
+
+    batch_size = 16
+    n_batches = (n_instances + batch_size - 1) // batch_size
+
+    all_costs = []
+
+    start_time = time.time()
+    for batch_idx in range(n_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, n_instances)
+        actual_batch_size = end_idx - start_idx
+
+        coords = torch.rand(actual_batch_size, n_nodes, 2, device=device)
+
+        # Process one at a time (official method expects batch=1)
+        for i in range(actual_batch_size):
+            single_coords = coords[i:i+1]
+            coords_np = single_coords[0].cpu().numpy()
+
+            with torch.no_grad():
+                tours, _ = run_inference_with_model(model, single_coords, device)
+
+            pred_tour = tours[0]
+            if len(pred_tour) == n_nodes + 1:
+                pred_tour = pred_tour[:-1]
+
+            cost = compute_tour_cost(coords_np, pred_tour + [pred_tour[0]])
+            all_costs.append(cost)
+
+        print(f"  Batch {batch_idx+1}/{n_batches}: processed {end_idx}/{n_instances}")
+
+    total_time = time.time() - start_time
+
+    print(f"\n  Results on {n_instances} instances:")
+    print(f"  Mean cost: {np.mean(all_costs):.4f}")
+    print(f"  Std cost: {np.std(all_costs):.4f}")
+    print(f"  Cost range: [{min(all_costs):.4f}, {max(all_costs):.4f}]")
+    print(f"  Total time: {total_time:.2f}s ({total_time/n_instances*1000:.1f}ms/inst)")
+
+    return all_costs
+
+
+def main():
+    print("="*60)
+    print("EDISCO Inference Test (PyTorch Lightning)")
+    print("="*60)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Device: {device}")
+
+    # Find checkpoint
+    ckpt_path = 'pretrained/edisco_tsp20.ckpt'
+    if not os.path.exists(ckpt_path):
+        print(f"ERROR: Checkpoint not found at {ckpt_path}")
+        return
+
+    n_nodes = 20
+
+    # Load model using PL
+    try:
+        model = load_model_from_checkpoint(ckpt_path, device, n_nodes)
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    # Run tests
+    try:
+        test_single_instance(model, n_nodes=n_nodes, device=device)
+        test_custom_vs_official(model, n_nodes=n_nodes, device=device)
+        test_many_instances(model, n_nodes=n_nodes, n_instances=100, device=device)
+
+        print("\n" + "="*60)
+        print("All tests completed!")
+        print("Expected TSP-20 cost: ~3.84 (without 2-opt)")
+        print("="*60)
+
+    except Exception as e:
+        print(f"\nTest failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == '__main__':
+    main()
