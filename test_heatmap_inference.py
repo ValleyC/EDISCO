@@ -145,28 +145,100 @@ class EDISCOHeatmapSolver:
     """
     EDISCO solver that returns edge probability heatmaps.
     No tour extraction - just soft costs.
+
+    Loads model directly without the full EDISCOModel class to avoid
+    cython_merge dependency.
     """
 
     def __init__(self, checkpoint_path, device='cuda', n_nodes=50):
         self.device = device
         self.n_nodes = n_nodes
 
-        # Load model
-        self.model = self._load_model(checkpoint_path, n_nodes)
-        self.model.eval()
-        self.model.to(device)
+        # Load model components directly (bypass EDISCOModel)
+        self.score_network, self.diffusion, self.config = self._load_model_direct(
+            checkpoint_path, n_nodes
+        )
+        self.score_network.eval()
+        self.score_network.to(device)
 
         # Freeze
-        for p in self.model.parameters():
+        for p in self.score_network.parameters():
             p.requires_grad = False
 
-    def _load_model(self, ckpt_path, n_nodes):
-        from pl_edisco_model import EDISCOModel
-        args = create_minimal_args(n_nodes=n_nodes)
-        model = EDISCOModel.load_from_checkpoint(
-            ckpt_path, param_args=args, map_location=self.device
+    def _load_model_direct(self, ckpt_path, n_nodes):
+        """
+        Load model weights directly without EDISCOModel class.
+        Avoids cython_merge import.
+        """
+        from models.continuous_score_network import ContinuousScoreNetwork
+        from utils.continuous_diffusion import ContinuousTimeCategoricalDiffusionDense
+
+        # Load checkpoint
+        checkpoint = torch.load(ckpt_path, map_location=self.device)
+
+        # Extract hyperparameters from checkpoint
+        hparams = checkpoint.get('hyper_parameters', {})
+        args = hparams.get('param_args', None)
+
+        if args is None:
+            # Use defaults
+            args = create_minimal_args(n_nodes=n_nodes)
+
+        # Model config
+        config = {
+            'n_layers': getattr(args, 'n_layers', 12),
+            'hidden_dim': getattr(args, 'hidden_dim', 256),
+            'node_dim': getattr(args, 'node_dim', 64),
+            'edge_dim': getattr(args, 'edge_dim', 64),
+            'time_dim': getattr(args, 'time_dim', 128),
+            'coord_dim': getattr(args, 'coord_dim', 2),
+            'aggregation': getattr(args, 'aggregation', 'sum'),
+            'beta_min': getattr(args, 'beta_min', 0.1),
+            'beta_max': getattr(args, 'beta_max', 1.5),
+            'solver_type': getattr(args, 'solver_type', 'pndm'),
+            'solver_steps': getattr(args, 'solver_steps', 50),
+            'time_schedule': getattr(args, 'time_schedule', 'linear'),
+            'adaptive_mixing': getattr(args, 'adaptive_mixing', True),
+            'deterministic_threshold': getattr(args, 'deterministic_threshold', 0.1),
+        }
+
+        # Create score network (EGNN-based)
+        score_network = ContinuousScoreNetwork(
+            n_layers=config['n_layers'],
+            hidden_dim=config['hidden_dim'],
+            node_dim=config['node_dim'],
+            edge_dim=config['edge_dim'],
+            time_dim=config['time_dim'],
+            coord_dim=config['coord_dim'],
+            aggregation=config['aggregation'],
         )
-        return model
+
+        # Load state dict
+        state_dict = checkpoint['state_dict']
+
+        # Filter for model weights (remove 'model.' prefix if present)
+        model_state = {}
+        for k, v in state_dict.items():
+            if k.startswith('model.'):
+                model_state[k[6:]] = v  # Remove 'model.' prefix
+            elif k.startswith('score_network.'):
+                model_state[k[14:]] = v  # Remove 'score_network.' prefix
+            else:
+                model_state[k] = v
+
+        # Load weights
+        score_network.load_state_dict(model_state, strict=False)
+
+        # Create diffusion
+        diffusion = ContinuousTimeCategoricalDiffusionDense(
+            beta_min=config['beta_min'],
+            beta_max=config['beta_max'],
+            num_classes=2
+        )
+
+        print(f"  Loaded model: {config['n_layers']} layers, hidden_dim={config['hidden_dim']}")
+
+        return score_network, diffusion, config
 
     @torch.no_grad()
     def get_heatmap(self, coords, n_steps=50):
@@ -194,17 +266,17 @@ class EDISCOHeatmapSolver:
                            device=self.device, dtype=torch.float32)
 
         # Create score function wrapper
-        score_fn = ScoreWrapper(self.model.score_network, coords, None)
+        score_fn = ScoreWrapper(self.score_network, coords, None)
 
         # Get solver
-        solver = get_solver(self.model.solver_type, n_steps)
+        solver = get_solver(self.config['solver_type'], n_steps)
 
         # Run diffusion
         edge_probs = solver.sample(
             score_fn, x_T, device=self.device,
-            schedule=self.model.time_schedule,
-            adaptive_mixing=self.model.use_adaptive_mixing,
-            deterministic_threshold=self.model.deterministic_threshold
+            schedule=self.config['time_schedule'],
+            adaptive_mixing=self.config['adaptive_mixing'],
+            deterministic_threshold=self.config['deterministic_threshold']
         )
 
         # Symmetrize
