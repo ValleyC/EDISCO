@@ -310,7 +310,7 @@ def run_inference_with_model(model, coords, device='cuda'):
     return tours, adj_probs
 
 
-def run_custom_diffusion(model, coords, device='cuda', n_steps=50):
+def run_custom_diffusion(model, coords, device='cuda', n_steps=50, debug=False):
     """
     Run diffusion manually using model components.
     For debugging - should match official inference.
@@ -327,6 +327,16 @@ def run_custom_diffusion(model, coords, device='cuda', n_steps=50):
     # Initialize from noise
     x_T = torch.randint(0, 2, (batch_size, n_nodes, n_nodes),
                        device=device, dtype=torch.float32)
+
+    if debug:
+        print(f"    DEBUG: x_T shape={x_T.shape}, sum={x_T.sum().item():.0f}")
+        print(f"    DEBUG: coords shape={coords.shape}")
+        print(f"    DEBUG: score_network type={type(model.score_network).__name__}")
+        print(f"    DEBUG: solver_type={model.solver_type}, n_steps={n_steps}")
+        print(f"    DEBUG: beta_min={model.args.beta_min}, beta_max={model.args.beta_max}")
+        print(f"    DEBUG: time_schedule={model.time_schedule}")
+        print(f"    DEBUG: adaptive_mixing={model.use_adaptive_mixing}")
+        print(f"    DEBUG: deterministic_threshold={model.deterministic_threshold}")
 
     # Use model's score_network and solver settings
     score_fn = ScoreWrapper(model.score_network, coords, None)
@@ -346,6 +356,9 @@ def run_custom_diffusion(model, coords, device='cuda', n_steps=50):
         adaptive_mixing=model.use_adaptive_mixing,
         deterministic_threshold=model.deterministic_threshold
     )
+
+    if debug:
+        print(f"    DEBUG: x0_pred shape={x0_pred.shape}, sum={x0_pred.sum().item():.0f}")
 
     return x0_pred
 
@@ -401,7 +414,7 @@ def test_custom_vs_official(model, n_nodes=20, device='cuda'):
 
     # Run custom diffusion
     print("  Running custom diffusion...")
-    adj_custom = run_custom_diffusion(model, coords, device, n_steps=50)
+    adj_custom = run_custom_diffusion(model, coords, device, n_steps=50, debug=True)
     adj_custom_np = adj_custom[0].cpu().numpy()
     adj_custom_np = (adj_custom_np + adj_custom_np.T) / 2
 
@@ -426,6 +439,47 @@ def test_custom_vs_official(model, n_nodes=20, device='cuda'):
         pred_tour = pred_tour[:-1]
     cost_official = compute_tour_cost(coords_np, pred_tour + [pred_tour[0]])
     print(f"  Official tour cost: {cost_official:.4f}")
+
+    # Debug: trace through official method manually
+    print("\n  Tracing official method internals...")
+    torch.manual_seed(42)
+    from utils.ode_solvers import get_solver
+    from models.continuous_score_network import ScoreWrapper
+
+    coords_test = coords.clone()
+    if coords_test.dim() == 2:
+        coords_test = coords_test.unsqueeze(0)
+    batch_size, n_nodes_t, _ = coords_test.shape
+
+    x_T = torch.randint(0, 2, (batch_size, n_nodes_t, n_nodes_t),
+                       device=device, dtype=torch.float32)
+    print(f"    x_T sum: {x_T.sum().item():.0f}")
+
+    # Check if model.score_network is same as model.model
+    print(f"    model.score_network is model.model: {model.score_network is model.model}")
+
+    # Get solver exactly as official does
+    beta_min = model.args.beta_min if hasattr(model.args, 'beta_min') else 0.1
+    beta_max = model.args.beta_max if hasattr(model.args, 'beta_max') else 1.5
+    solver = get_solver(model.solver_type, model.solver_steps, beta_min=beta_min, beta_max=beta_max)
+
+    score_fn = ScoreWrapper(model.score_network, coords_test, None)
+
+    # Test score_fn directly
+    with torch.no_grad():
+        test_out = score_fn(x_T, 0.5)
+    print(f"    score_fn output shape: {test_out.shape}")
+    probs = torch.softmax(test_out, dim=-1)
+    print(f"    At t=0.5: edge_prob mean={probs[...,1].mean().item():.4f}")
+
+    # Run solver
+    x0_pred_trace = solver.sample(
+        score_fn, x_T, device=device,
+        schedule=model.time_schedule,
+        adaptive_mixing=model.use_adaptive_mixing,
+        deterministic_threshold=model.deterministic_threshold
+    )
+    print(f"    x0_pred_trace sum: {x0_pred_trace.sum().item():.0f}")
 
     return cost_custom, cost_official
 
