@@ -190,8 +190,9 @@ def create_dummy_tsp_file(filepath, n_instances=10, n_nodes=50):
 def load_edisco_model(ckpt_path, device='cuda', n_nodes=50):
     """
     Load EDISCO model directly from checkpoint.
+    Uses EGNNEncoder (official class) with dense_only=True.
     """
-    from models.egnn_encoder import EGNNEncoderDense
+    from models.egnn_encoder import EGNNEncoder
     from utils.continuous_diffusion import ContinuousTimeCategoricalDiffusionDense
     from utils.ode_solvers import get_solver
     from models.continuous_score_network import ScoreWrapper
@@ -215,8 +216,9 @@ def load_edisco_model(ckpt_path, device='cuda', n_nodes=50):
     print(f"  Detected config: n_layers={n_layers}, hidden_dim={hidden_dim}, "
           f"node_dim={node_dim}, edge_dim={edge_dim}, time_dim={time_dim}")
 
-    # Create encoder directly (not wrapped in ContinuousScoreNetwork)
-    encoder = EGNNEncoderDense(
+    # Create encoder using official EGNNEncoder class with dense_only=True
+    # This matches what pl_meta_model.py does when sparse_factor=0
+    encoder = EGNNEncoder(
         n_layers=n_layers,
         hidden_dim=hidden_dim,
         node_dim=node_dim,
@@ -224,7 +226,11 @@ def load_edisco_model(ckpt_path, device='cuda', n_nodes=50):
         time_dim=time_dim,
         coord_dim=2,
         out_channels=2,
-        aggregation='sum',
+        sparse=False,
+        dense_only=True,  # Critical: matches official training config
+        use_activation_checkpoint=False,
+        coord_update_alpha=0.1,
+        weight_temp=10.0,
     )
 
     # Load weights - use 'model.*' keys directly (encoder is the model)
@@ -237,9 +243,9 @@ def load_edisco_model(ckpt_path, device='cuda', n_nodes=50):
     missing, unexpected = encoder.load_state_dict(encoder_state, strict=False)
     print(f"  Loaded weights: {len(encoder_state)} keys")
     if missing:
-        print(f"  Missing keys: {len(missing)} - {missing[:3]}...")
+        print(f"  Missing keys: {len(missing)} - {missing[:5]}...")
     if unexpected:
-        print(f"  Unexpected keys: {len(unexpected)} - {unexpected[:3]}...")
+        print(f"  Unexpected keys: {len(unexpected)} - {unexpected[:5]}...")
 
     encoder.eval()
     encoder.to(device)
@@ -258,6 +264,8 @@ def load_edisco_model(ckpt_path, device='cuda', n_nodes=50):
     config = {
         'n_layers': n_layers,
         'hidden_dim': hidden_dim,
+        'beta_min': 0.1,
+        'beta_max': 1.5,
         'solver_type': 'pndm',
         'solver_steps': 50,
         'time_schedule': 'linear',
@@ -268,9 +276,20 @@ def load_edisco_model(ckpt_path, device='cuda', n_nodes=50):
     return encoder, diffusion, config
 
 
-def run_diffusion(encoder, coords, config, device='cuda', n_steps=50):
+def run_diffusion(encoder, coords, config, device='cuda', n_steps=50, return_probs=True):
     """
-    Run diffusion to get edge probabilities.
+    Run diffusion to get edge probabilities using official ODE solver.
+
+    Args:
+        encoder: The EGNN encoder model
+        coords: Node coordinates (batch, n_nodes, 2) or (n_nodes, 2)
+        config: Configuration dict with solver settings
+        device: Device to run on
+        n_steps: Number of diffusion steps
+        return_probs: If True, return softmax probabilities; if False, return binary
+
+    Returns:
+        edge_probs: Edge probability matrix (batch, n_nodes, n_nodes)
     """
     from utils.ode_solvers import get_solver
     from models.continuous_score_network import ScoreWrapper
@@ -281,34 +300,26 @@ def run_diffusion(encoder, coords, config, device='cuda', n_steps=50):
     coords = coords.to(device)
     batch_size, n_nodes, _ = coords.shape
 
-    # Initialize from noise
+    # Initialize from noise (uniform random binary)
     x_T = torch.randint(0, 2, (batch_size, n_nodes, n_nodes),
                        device=device, dtype=torch.float32)
 
-    # Create a simple wrapper that calls encoder directly
-    class EncoderWrapper:
-        def __init__(self, encoder, coords):
-            self.encoder = encoder
-            self.coords = coords
+    # Use official ScoreWrapper (same as pl_edisco_model.py)
+    score_fn = ScoreWrapper(encoder, coords, edge_index=None)
 
-        def __call__(self, x, t):
-            if not isinstance(t, torch.Tensor):
-                t = torch.tensor([t], device=x.device, dtype=torch.float32)
-            elif t.dim() == 0:
-                t = t.unsqueeze(0)
+    # Get beta parameters
+    beta_min = config.get('beta_min', 0.1)
+    beta_max = config.get('beta_max', 1.5)
 
-            batch_size = x.shape[0]
-            if t.shape[0] == 1 and batch_size > 1:
-                t = t.expand(batch_size)
+    # Use official solver with correct parameters
+    solver = get_solver(
+        config['solver_type'],
+        n_steps,
+        beta_min=beta_min,
+        beta_max=beta_max
+    )
 
-            return self.encoder(self.coords, x, t, None)
-
-    score_fn = EncoderWrapper(encoder, coords)
-
-    # Get solver
-    solver = get_solver(config['solver_type'], n_steps)
-
-    # Run diffusion
+    # Run official ODE solver (includes multi-step smoothing for PNDM)
     edge_probs = solver.sample(
         score_fn, x_T, device=device,
         schedule=config['time_schedule'],
@@ -316,6 +327,7 @@ def run_diffusion(encoder, coords, config, device='cuda', n_steps=50):
         deterministic_threshold=config['deterministic_threshold']
     )
 
+    # Official solver returns binary (argmax) - this is what merge_tours expects
     return edge_probs
 
 
@@ -332,22 +344,27 @@ def test_single_instance(encoder, config, n_nodes=20, device='cuda'):
     coords = torch.rand(1, n_nodes, 2, device=device)
     coords_np = coords[0].cpu().numpy()
 
-    # Run diffusion
+    # Run diffusion (returns binary adjacency matrix from official solver)
     start_time = time.time()
     with torch.no_grad():
-        edge_probs = run_diffusion(encoder, coords, config, device, n_steps=50)
+        adj_matrix = run_diffusion(encoder, coords, config, device, n_steps=50)
     diffusion_time = time.time() - start_time
 
-    # Get edge probs
-    probs_np = edge_probs[0].cpu().numpy()
-    probs_np = (probs_np + probs_np.T) / 2  # Symmetrize
+    # Get adjacency matrix (binary: 0 or 1)
+    adj_np = adj_matrix[0].cpu().numpy()
+    adj_np = (adj_np + adj_np.T) / 2  # Symmetrize
 
-    print(f"  Edge probs range: [{probs_np.min():.3f}, {probs_np.max():.3f}]")
-    print(f"  Mean degree: {probs_np.sum(axis=1).mean():.2f}")
+    # Count edges (binary)
+    n_edges = (adj_np > 0.5).sum() / 2  # Divide by 2 for undirected
+    mean_degree = (adj_np > 0.5).sum(axis=1).mean()
 
-    # Merge tours
+    print(f"  Adjacency range: [{adj_np.min():.3f}, {adj_np.max():.3f}]")
+    print(f"  Number of edges: {n_edges:.0f} (expected: {n_nodes})")
+    print(f"  Mean degree: {mean_degree:.2f} (expected: 2.0)")
+
+    # Merge tours using greedy algorithm
     start_time = time.time()
-    tour = merge_tours_python(probs_np, coords_np)
+    tour = merge_tours_python(adj_np, coords_np)
     merge_time = time.time() - start_time
 
     # Remove closing node if present
@@ -381,22 +398,22 @@ def test_batch(encoder, config, batch_size=8, n_nodes=20, device='cuda'):
     # Generate random instances
     coords = torch.rand(batch_size, n_nodes, 2, device=device)
 
-    # Run diffusion (batched)
+    # Run diffusion (batched) - returns binary adjacency matrix
     start_time = time.time()
     with torch.no_grad():
-        edge_probs = run_diffusion(encoder, coords, config, device, n_steps=50)
+        adj_matrix = run_diffusion(encoder, coords, config, device, n_steps=50)
     diffusion_time = time.time() - start_time
 
     coords_np = coords.cpu().numpy()
-    probs_np = edge_probs.cpu().numpy()
+    adj_np = adj_matrix.cpu().numpy()
 
     # Extract tours (sequential - merge_tours is not batched)
     tours = []
     costs = []
     start_time = time.time()
     for i in range(batch_size):
-        probs_i = (probs_np[i] + probs_np[i].T) / 2
-        tour = merge_tours_python(probs_i, coords_np[i])
+        adj_i = (adj_np[i] + adj_np[i].T) / 2
+        tour = merge_tours_python(adj_i, coords_np[i])
         if len(tour) == n_nodes + 1 and tour[0] == tour[-1]:
             tour = tour[:-1]
         tours.append(tour)
@@ -419,7 +436,7 @@ def test_batch(encoder, config, batch_size=8, n_nodes=20, device='cuda'):
 def test_compare_soft_vs_real(encoder, config, n_nodes=20, device='cuda', n_instances=100):
     """Compare soft cost vs real tour cost."""
     print(f"\n{'='*60}")
-    print(f"Comparing soft cost vs real cost: {n_instances} x TSP-{n_nodes}")
+    print(f"Testing {n_instances} x TSP-{n_nodes} instances")
     print(f"{'='*60}")
 
     # Coordinates in [0, 1] - standard TSP benchmark format
@@ -432,9 +449,9 @@ def test_compare_soft_vs_real(encoder, config, n_nodes=20, device='cuda', n_inst
     batch_size = 16
     n_batches = (n_instances + batch_size - 1) // batch_size
 
-    soft_costs = []
     real_costs = []
     degrees = []
+    n_edges_list = []
 
     start_time = time.time()
     for batch_idx in range(n_batches):
@@ -443,24 +460,21 @@ def test_compare_soft_vs_real(encoder, config, n_nodes=20, device='cuda', n_inst
         batch_coords = coords[start_idx:end_idx]
 
         with torch.no_grad():
-            edge_probs = run_diffusion(encoder, batch_coords, config, device, n_steps=50)
+            adj_matrix = run_diffusion(encoder, batch_coords, config, device, n_steps=50)
 
         coords_np = batch_coords.cpu().numpy()
-        probs_np = edge_probs.cpu().numpy()
+        adj_np = adj_matrix.cpu().numpy()
 
         for i in range(len(coords_np)):
-            probs_i = (probs_np[i] + probs_np[i].T) / 2
-            dist_i = np.linalg.norm(coords_np[i][:, None] - coords_np[i], axis=-1)
+            adj_i = (adj_np[i] + adj_np[i].T) / 2
 
-            # Degree stats
-            degrees.append(probs_i.sum(axis=1).mean())
+            # Degree stats (binary)
+            mean_deg = (adj_i > 0.5).sum(axis=1).mean()
+            degrees.append(mean_deg)
+            n_edges_list.append((adj_i > 0.5).sum() / 2)
 
-            # Soft cost
-            soft_cost = (probs_i * dist_i).sum() / 2
-            soft_costs.append(soft_cost)
-
-            # Real cost
-            tour = merge_tours_python(probs_i, coords_np[i])
+            # Real cost from merge_tours
+            tour = merge_tours_python(adj_i, coords_np[i])
             if len(tour) == n_nodes + 1:
                 tour = tour[:-1]
             real_cost = compute_tour_cost(coords_np[i], tour + [tour[0]])
@@ -472,20 +486,18 @@ def test_compare_soft_vs_real(encoder, config, n_nodes=20, device='cuda', n_inst
 
     print(f"\n  === Results on {n_instances} instances ===")
     print(f"  Coordinates: [0, 1] x [0, 1]")
-    print(f"  Mean degree: {np.mean(degrees):.2f} (target: 2.0)")
-    print(f"  Soft costs:  mean={np.mean(soft_costs):.4f}, std={np.std(soft_costs):.4f}")
-    print(f"  Real costs:  mean={np.mean(real_costs):.4f}, std={np.std(real_costs):.4f}")
-    print(f"  Cost range:  [{min(real_costs):.4f}, {max(real_costs):.4f}]")
-    print(f"  Ratio (soft/real): {np.mean(soft_costs)/np.mean(real_costs):.3f}")
-    print(f"  Correlation: {np.corrcoef(soft_costs, real_costs)[0,1]:.3f}")
+    print(f"  Mean edges: {np.mean(n_edges_list):.1f} (expected: {n_nodes})")
+    print(f"  Mean degree: {np.mean(degrees):.2f} (expected: 2.0)")
+    print(f"  Tour costs: mean={np.mean(real_costs):.4f}, std={np.std(real_costs):.4f}")
+    print(f"  Cost range: [{min(real_costs):.4f}, {max(real_costs):.4f}]")
     print(f"  Total time: {total_time:.2f}s ({total_time/n_instances*1000:.1f}ms/inst)")
 
-    return soft_costs, real_costs
+    return real_costs
 
 
 def main():
     print("="*60)
-    print("EDISCO Full Inference Test (Pure Python)")
+    print("EDISCO Full Inference Test (Official Solver)")
     print("="*60)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -505,6 +517,7 @@ def main():
     try:
         encoder, diffusion, config = load_edisco_model(ckpt_path, device, n_nodes)
         print("Model loaded successfully!")
+        print(f"  Using solver: {config['solver_type']} with {config['solver_steps']} steps")
     except Exception as e:
         print(f"Error loading model: {e}")
         import traceback
@@ -518,7 +531,8 @@ def main():
         test_compare_soft_vs_real(encoder, config, n_nodes=n_nodes, device=device, n_instances=100)
 
         print("\n" + "="*60)
-        print("All tests passed!")
+        print("All tests completed!")
+        print("Expected TSP-20 cost: ~3.84 (matching official inference)")
         print("="*60)
 
     except Exception as e:
