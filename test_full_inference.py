@@ -416,43 +416,69 @@ def test_batch(encoder, config, batch_size=8, n_nodes=20, device='cuda'):
     return tours, costs
 
 
-def test_compare_soft_vs_real(encoder, config, n_nodes=20, device='cuda'):
+def test_compare_soft_vs_real(encoder, config, n_nodes=20, device='cuda', n_instances=100):
     """Compare soft cost vs real tour cost."""
     print(f"\n{'='*60}")
-    print(f"Comparing soft cost vs real cost: TSP-{n_nodes}")
+    print(f"Comparing soft cost vs real cost: {n_instances} x TSP-{n_nodes}")
     print(f"{'='*60}")
 
-    n_instances = 10
+    # Coordinates in [0, 1] - standard TSP benchmark format
+    torch.manual_seed(0)  # For reproducibility
     coords = torch.rand(n_instances, n_nodes, 2, device=device)
 
-    with torch.no_grad():
-        edge_probs = run_diffusion(encoder, coords, config, device, n_steps=50)
+    print(f"  Coordinates range: [{coords.min().item():.4f}, {coords.max().item():.4f}]")
 
-    coords_np = coords.cpu().numpy()
-    probs_np = edge_probs.cpu().numpy()
+    # Process in batches to avoid OOM
+    batch_size = 16
+    n_batches = (n_instances + batch_size - 1) // batch_size
 
     soft_costs = []
     real_costs = []
+    degrees = []
 
-    for i in range(n_instances):
-        probs_i = (probs_np[i] + probs_np[i].T) / 2
-        dist_i = np.linalg.norm(coords_np[i][:, None] - coords_np[i], axis=-1)
+    start_time = time.time()
+    for batch_idx in range(n_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, n_instances)
+        batch_coords = coords[start_idx:end_idx]
 
-        # Soft cost
-        soft_cost = (probs_i * dist_i).sum() / 2
-        soft_costs.append(soft_cost)
+        with torch.no_grad():
+            edge_probs = run_diffusion(encoder, batch_coords, config, device, n_steps=50)
 
-        # Real cost
-        tour = merge_tours_python(probs_i, coords_np[i])
-        if len(tour) == n_nodes + 1:
-            tour = tour[:-1]
-        real_cost = compute_tour_cost(coords_np[i], tour + [tour[0]])
-        real_costs.append(real_cost)
+        coords_np = batch_coords.cpu().numpy()
+        probs_np = edge_probs.cpu().numpy()
 
+        for i in range(len(coords_np)):
+            probs_i = (probs_np[i] + probs_np[i].T) / 2
+            dist_i = np.linalg.norm(coords_np[i][:, None] - coords_np[i], axis=-1)
+
+            # Degree stats
+            degrees.append(probs_i.sum(axis=1).mean())
+
+            # Soft cost
+            soft_cost = (probs_i * dist_i).sum() / 2
+            soft_costs.append(soft_cost)
+
+            # Real cost
+            tour = merge_tours_python(probs_i, coords_np[i])
+            if len(tour) == n_nodes + 1:
+                tour = tour[:-1]
+            real_cost = compute_tour_cost(coords_np[i], tour + [tour[0]])
+            real_costs.append(real_cost)
+
+        print(f"  Batch {batch_idx+1}/{n_batches}: processed {end_idx}/{n_instances} instances")
+
+    total_time = time.time() - start_time
+
+    print(f"\n  === Results on {n_instances} instances ===")
+    print(f"  Coordinates: [0, 1] x [0, 1]")
+    print(f"  Mean degree: {np.mean(degrees):.2f} (target: 2.0)")
     print(f"  Soft costs:  mean={np.mean(soft_costs):.4f}, std={np.std(soft_costs):.4f}")
     print(f"  Real costs:  mean={np.mean(real_costs):.4f}, std={np.std(real_costs):.4f}")
+    print(f"  Cost range:  [{min(real_costs):.4f}, {max(real_costs):.4f}]")
     print(f"  Ratio (soft/real): {np.mean(soft_costs)/np.mean(real_costs):.3f}")
     print(f"  Correlation: {np.corrcoef(soft_costs, real_costs)[0,1]:.3f}")
+    print(f"  Total time: {total_time:.2f}s ({total_time/n_instances*1000:.1f}ms/inst)")
 
     return soft_costs, real_costs
 
@@ -489,7 +515,7 @@ def main():
     try:
         test_single_instance(encoder, config, n_nodes=n_nodes, device=device)
         test_batch(encoder, config, batch_size=8, n_nodes=n_nodes, device=device)
-        test_compare_soft_vs_real(encoder, config, n_nodes=n_nodes, device=device)
+        test_compare_soft_vs_real(encoder, config, n_nodes=n_nodes, device=device, n_instances=100)
 
         print("\n" + "="*60)
         print("All tests passed!")
