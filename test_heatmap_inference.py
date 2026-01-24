@@ -202,8 +202,9 @@ class EDISCOHeatmapSolver:
             'deterministic_threshold': getattr(args, 'deterministic_threshold', 0.1),
         }
 
-        # Create score network (EGNN-based)
+        # Create score network (EGNN-based, dense mode)
         score_network = ContinuousScoreNetwork(
+            encoder_type='egnn',
             n_layers=config['n_layers'],
             hidden_dim=config['hidden_dim'],
             node_dim=config['node_dim'],
@@ -211,23 +212,31 @@ class EDISCOHeatmapSolver:
             time_dim=config['time_dim'],
             coord_dim=config['coord_dim'],
             aggregation=config['aggregation'],
+            sparse=False,
+            dense_only=True,  # Use dense mode
         )
 
         # Load state dict
         state_dict = checkpoint['state_dict']
 
-        # Filter for model weights (remove 'model.' prefix if present)
+        # The checkpoint saves encoder as 'model.X'
+        # ContinuousScoreNetwork has encoder at 'encoder.X'
+        # So we need: 'model.X' -> 'encoder.X'
         model_state = {}
         for k, v in state_dict.items():
             if k.startswith('model.'):
-                model_state[k[6:]] = v  # Remove 'model.' prefix
-            elif k.startswith('score_network.'):
-                model_state[k[14:]] = v  # Remove 'score_network.' prefix
+                # model.X -> encoder.X
+                new_key = 'encoder.' + k[6:]
+                model_state[new_key] = v
             else:
                 model_state[k] = v
 
         # Load weights
-        score_network.load_state_dict(model_state, strict=False)
+        missing, unexpected = score_network.load_state_dict(model_state, strict=False)
+        if missing:
+            print(f"  Warning: Missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+        if unexpected:
+            print(f"  Warning: Unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
 
         # Create diffusion
         diffusion = ContinuousTimeCategoricalDiffusionDense(
