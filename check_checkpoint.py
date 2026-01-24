@@ -8,15 +8,30 @@ print("Top-level keys:")
 for k in checkpoint.keys():
     print(f"  {k}")
 
-print("\nState dict keys (first 20):")
+print("\nState dict keys - ALL unique prefixes:")
 state_dict = checkpoint.get('state_dict', {})
-for i, k in enumerate(state_dict.keys()):
-    print(f"  {k}: {state_dict[k].shape}")
-    if i >= 20:
-        print(f"  ... and {len(state_dict) - 20} more")
-        break
+prefixes = set()
+for k in state_dict.keys():
+    prefix = k.split('.')[0]
+    prefixes.add(prefix)
+print(f"  Prefixes: {prefixes}")
 
-print("\nHyper parameters:")
-hparams = checkpoint.get('hyper_parameters', {})
-for k, v in hparams.items():
-    print(f"  {k}: {v}")
+print("\nState dict keys with 'model.' prefix (first 10):")
+for i, k in enumerate(state_dict.keys()):
+    if k.startswith('model.'):
+        print(f"  {k}: {state_dict[k].shape}")
+        if i >= 10:
+            break
+
+print("\nState dict keys with 'score_network.' prefix (first 10):")
+count = 0
+for k in state_dict.keys():
+    if k.startswith('score_network.'):
+        print(f"  {k}: {state_dict[k].shape}")
+        count += 1
+        if count >= 10:
+            break
+
+print(f"\nTotal keys: {len(state_dict)}")
+print(f"Keys starting with 'model.': {sum(1 for k in state_dict if k.startswith('model.'))}")
+print(f"Keys starting with 'score_network.': {sum(1 for k in state_dict if k.startswith('score_network.'))}")
