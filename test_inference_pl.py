@@ -130,7 +130,8 @@ def extract_tour_from_adj(adj_mat):
 
 def merge_tours_python(adj_probs, coords):
     """Pure Python merge_tours implementation."""
-    adj_probs = (adj_probs + adj_probs.T) / 2
+    # Use max for symmetrization to preserve binary edges
+    adj_probs = np.maximum(adj_probs, adj_probs.T)
     real_adj, _ = numpy_merge(coords, adj_probs)
     tour = extract_tour_from_adj(real_adj)
     return tour
@@ -416,7 +417,10 @@ def test_custom_vs_official(model, n_nodes=20, device='cuda'):
     print("  Running custom diffusion...")
     adj_custom = run_custom_diffusion(model, coords, device, n_steps=50, debug=True)
     adj_custom_np = adj_custom[0].cpu().numpy()
-    adj_custom_np = (adj_custom_np + adj_custom_np.T) / 2
+
+    # FIX: Use max for symmetrization, not average!
+    # Binary solver output: adj[i,j]=1, adj[j,i]=0 → average gives 0.5 which fails >0.5 threshold
+    adj_custom_np = np.maximum(adj_custom_np, adj_custom_np.T)
 
     n_edges_custom = (adj_custom_np > 0.5).sum() / 2
     mean_degree_custom = (adj_custom_np > 0.5).sum(axis=1).mean()
