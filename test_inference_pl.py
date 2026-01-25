@@ -15,125 +15,34 @@ from argparse import Namespace
 
 # ============ Pure Python merge_tours ============
 
-def numpy_merge(points, adj_mat):
+def merge_tours_python(adj_mat, coords):
     """
-    Pure Python/NumPy implementation of tour merging.
-    Greedy edge insertion based on (probability / distance) ratio.
+    Pure Python merge_tours using official numpy_merge from tsp_utils.
+    No Cython dependency - uses the same algorithm as cython_merge.
+
+    Args:
+        adj_mat: Symmetrized adjacency matrix (n, n) - should be adj + adj.T
+        coords: Node coordinates (n, 2)
+
+    Returns:
+        tour: List of node indices forming a valid TSP tour
     """
-    n = adj_mat.shape[0]
-    dists = np.linalg.norm(points[:, None] - points, axis=-1)
-    dists[dists == 0] = 1e-10
+    from utils.tsp_utils import numpy_merge
 
-    scores = adj_mat / dists
+    # Use the official numpy_merge algorithm (same logic as cython_merge)
+    real_adj_mat, merge_iterations = numpy_merge(coords, adj_mat)
 
-    parent = list(range(n))
-    rank = [0] * n
-    endpoints = {i: [i, i] for i in range(n)}
-    degree = [0] * n
-
-    def find(x):
-        if parent[x] != x:
-            parent[x] = find(parent[x])
-        return parent[x]
-
-    def union(x, y):
-        px, py = find(x), find(y)
-        if px == py:
-            return False
-        if rank[px] < rank[py]:
-            px, py = py, px
-        parent[py] = px
-        if rank[px] == rank[py]:
-            rank[px] += 1
-        ex, ey = endpoints[px], endpoints[py]
-        new_endpoints = []
-        for e in ex + ey:
-            if e != x and e != y:
-                new_endpoints.append(e)
-        if len(new_endpoints) == 0:
-            new_endpoints = [x, y]
-        elif len(new_endpoints) == 1:
-            new_endpoints = new_endpoints + new_endpoints
-        endpoints[px] = new_endpoints[:2]
-        return True
-
-    real_adj = np.zeros((n, n))
-
-    edges = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            edges.append((scores[i, j], i, j))
-    edges.sort(reverse=True)
-
-    edge_count = 0
-    for score, i, j in edges:
-        if edge_count >= n:
-            break
-
-        if degree[i] >= 2 or degree[j] >= 2:
-            continue
-
-        pi, pj = find(i), find(j)
-
-        if pi == pj:
-            if edge_count == n - 1:
-                real_adj[i, j] = 1
-                real_adj[j, i] = 1
-                edge_count += 1
-            continue
-
-        ei, ej = endpoints[pi], endpoints[pj]
-        if i not in ei or j not in ej:
-            continue
-
-        real_adj[i, j] = 1
-        real_adj[j, i] = 1
-        degree[i] += 1
-        degree[j] += 1
-        union(i, j)
-        edge_count += 1
-
-    return real_adj, edge_count
-
-
-def extract_tour_from_adj(adj_mat):
-    """Extract tour from adjacency matrix."""
+    # Extract tour from adjacency matrix (same as official merge_tours)
     n = adj_mat.shape[0]
     tour = [0]
-    visited = {0}
-
-    while len(tour) < n:
-        current = tour[-1]
-        neighbors = np.where(adj_mat[current] > 0)[0]
-
-        next_node = None
-        for nb in neighbors:
-            if nb not in visited:
-                next_node = nb
-                break
-
-        if next_node is None:
-            for i in range(n):
-                if i not in visited:
-                    next_node = i
-                    break
-
-        if next_node is None:
+    while len(tour) < n + 1:
+        neighbors = np.nonzero(real_adj_mat[tour[-1]])[0]
+        if len(tour) > 1:
+            neighbors = neighbors[neighbors != tour[-2]]
+        if len(neighbors) == 0:
             break
+        tour.append(neighbors.max())
 
-        tour.append(next_node)
-        visited.add(next_node)
-
-    tour.append(tour[0])
-    return tour
-
-
-def merge_tours_python(adj_probs, coords):
-    """Pure Python merge_tours implementation."""
-    # Use max for symmetrization to preserve binary edges
-    adj_probs = np.maximum(adj_probs, adj_probs.T)
-    real_adj, _ = numpy_merge(coords, adj_probs)
-    tour = extract_tour_from_adj(real_adj)
     return tour
 
 
@@ -418,21 +327,35 @@ def test_custom_vs_official(model, n_nodes=20, device='cuda'):
     adj_custom = run_custom_diffusion(model, coords, device, n_steps=50, debug=True)
     adj_custom_np = adj_custom[0].cpu().numpy()
 
-    # FIX: Use max for symmetrization, not average!
-    # Binary solver output: adj[i,j]=1, adj[j,i]=0 → average gives 0.5 which fails >0.5 threshold
-    adj_custom_np = np.maximum(adj_custom_np, adj_custom_np.T)
+    # Use SUM symmetrization (like official), not max or average
+    adj_custom_sym = adj_custom_np + adj_custom_np.T
 
-    n_edges_custom = (adj_custom_np > 0.5).sum() / 2
-    mean_degree_custom = (adj_custom_np > 0.5).sum(axis=1).mean()
+    n_edges_custom = (adj_custom_sym > 0.5).sum() / 2
+    mean_degree_custom = (adj_custom_sym > 0.5).sum(axis=1).mean()
 
     print(f"  Custom: edges={n_edges_custom:.0f}, mean_degree={mean_degree_custom:.2f}")
 
-    # Extract tour
-    tour_custom = merge_tours_python(adj_custom_np, coords_np)
+    # Use OFFICIAL merge_tours (same as pl_edisco_model uses)
+    from utils.tsp_utils import merge_tours as official_merge_tours
+    tours_custom, _ = official_merge_tours(
+        adj_custom_sym[np.newaxis, ...],  # Add batch dim
+        coords_np,
+        None,  # edge_index_np
+        sparse_graph=False,
+        parallel_sampling=1
+    )
+    tour_custom = tours_custom[0]
     if len(tour_custom) == n_nodes + 1:
         tour_custom = tour_custom[:-1]
     cost_custom = compute_tour_cost(coords_np, tour_custom + [tour_custom[0]])
-    print(f"  Custom tour cost: {cost_custom:.4f}")
+    print(f"  Custom tour cost (official merge): {cost_custom:.4f}")
+
+    # Also test with Python merge for comparison
+    tour_python = merge_tours_python(adj_custom_sym, coords_np)
+    if len(tour_python) == n_nodes + 1:
+        tour_python = tour_python[:-1]
+    cost_python = compute_tour_cost(coords_np, tour_python + [tour_python[0]])
+    print(f"  Custom tour cost (Python merge): {cost_python:.4f}")
 
     # Run official inference
     print("  Running official inference...")
