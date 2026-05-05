@@ -1,8 +1,8 @@
-# EDISCO: Equivariant Continuous-Time Diffusion for Combinatorial Optimization
+# EDISCO: Equivariant Discrete Diffusion for Euclidean Combinatorial Optimization
 
-**Anonymous Implementation for ICML 2026 Submission**
+**Anonymous Implementation for NeurIPS 2026 Submission**
 
-This repository contains the implementation of EDISCO, an equivariant continuous-time diffusion model for solving geometric combinatorial optimization problems.
+EDISCO is a discrete diffusion model for Euclidean combinatorial optimization problems whose generative distribution over node-index solutions is exactly E(2)-invariant by construction. The pipeline composes an E(2)-equivariant score network, a categorical continuous-time Markov chain over edge variables, and Native Edge Expansion (NEE) decoding that operates only on invariant quantities.
 
 ## Visualization
 
@@ -15,7 +15,7 @@ conda env create -f environment.yml
 conda activate edisco
 ```
 
-EDISCO requires the Cython package for merging the diffusion heatmaps:
+EDISCO uses a Cython extension for diffusion-heatmap merging:
 
 ```bash
 cd edisco/utils/cython_merge
@@ -25,8 +25,8 @@ cd -
 
 ## Data
 
-Please refer to the `data` folder.
+See the `data` folder for dataset preparation instructions.
 
 ## Reproduction
 
-Please take a look at the [reproducing_scripts](reproducing_scripts.md) for details.
+See [reproducing_scripts.md](reproducing_scripts.md) for training and evaluation commands across TSP, CVRP, ESTP, and MIS.
