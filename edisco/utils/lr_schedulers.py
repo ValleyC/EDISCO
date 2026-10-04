@@ -1,4 +1,4 @@
-"""Misc. optimizer implementations."""
+"""Learning-rate schedules."""
 from functools import partial
 
 import torch

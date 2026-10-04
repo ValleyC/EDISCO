@@ -1,54 +1,26 @@
 """
 Generate Euclidean Steiner Tree datasets.
 
-This script generates Steiner Tree instances with Iterated 1-Steiner solutions
-in the same format as TSP data for EDISCO training.
+Every instance has `problem_size` terminals and the same number of candidate
+Steiner points, all uniform on the unit square. The reference tree is computed
+by iterated 1-Steiner on the candidate set or by GeoSteiner.
 
-Data format (per line):
+Data format (one instance per line):
     terminals_x1 terminals_y1 ... SEP candidates_x1 candidates_y1 ... output adj_00 adj_01 ...
 
-Example usage:
-    python generate_steiner_data.py --problem_size 10 --num_samples 10000 \\
-        --filename steiner10_train.txt --solver iterated_1steiner
+Example:
+    python data/generate_steiner_data.py --problem_size 10 --num_samples 10000 --filename steiner10_train.txt
 """
 
 import argparse
+import os
+import sys
+
 import numpy as np
 from tqdm import tqdm
-import sys
-import os
 
-# Add EDISCO to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../edisco')))
-
-try:
-    from utils.steiner_utils import IteratedOneSteinerSolver, SteinerTreeEvaluator, GeoSteinerSolver
-except ImportError:
-    print("Warning: Could not import steiner_utils, using MST fallback")
-    from scipy.sparse.csgraph import minimum_spanning_tree
-    from scipy.spatial import distance_matrix
-
-    class IteratedOneSteinerSolver:
-        @staticmethod
-        def solve(coords, is_terminal, max_iterations=5):
-            n = len(coords)
-            dist_mat = distance_matrix(coords, coords)
-            mst = minimum_spanning_tree(dist_mat)
-            mst_array = mst.toarray()
-            adjacency = np.zeros((n, n), dtype=np.float32)
-            total_length = 0.0
-            for i in range(n):
-                for j in range(i+1, n):
-                    if mst_array[i, j] > 0 or mst_array[j, i] > 0:
-                        adjacency[i, j] = 1.0
-                        adjacency[j, i] = 1.0
-                        total_length += dist_mat[i, j]
-            return adjacency, total_length
-
-    class GeoSteinerSolver:
-        @staticmethod
-        def solve(coords, is_terminal, **kwargs):
-            raise ImportError("GeoSteiner solver requires steiner_utils module")
+from utils.steiner_utils import GeoSteinerSolver, IteratedOneSteinerSolver  # noqa: E402
 
 
 def generate_steiner_instance(problem_size, seed=None, solver='iterated_1steiner'):
@@ -57,7 +29,7 @@ def generate_steiner_instance(problem_size, seed=None, solver='iterated_1steiner
     Args:
         problem_size: Number of terminal points
         seed: Random seed
-        solver: Solver to use ('iterated_1steiner', 'geosteiner', etc.)
+        solver: 'iterated_1steiner' or 'geosteiner'
 
     Returns:
         terminals: (n_terminals, 2) coordinates
@@ -179,9 +151,9 @@ if __name__ == "__main__":
     parser.add_argument('--filename', type=str, required=True,
                        help='Output filename (e.g., steiner10_train.txt)')
     parser.add_argument('--solver', type=str, default='iterated_1steiner',
-                       choices=['mst', '1steiner', 'iterated_1steiner', 'geosteiner'],
-                       help='Solver for ground truth (default: iterated_1steiner). '
-                            'geosteiner requires GeoSteiner installed (http://www.geosteiner.com/)')
+                       choices=['iterated_1steiner', 'geosteiner'],
+                       help='Reference solver (default: iterated_1steiner). '
+                            'geosteiner requires GeoSteiner (http://www.geosteiner.com/)')
     parser.add_argument('--seed', type=int, default=1234,
                        help='Random seed (default: 1234)')
 

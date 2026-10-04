@@ -1,13 +1,10 @@
-"""Euclidean Steiner Tree Graph Dataset
-
-Dataset for Euclidean Steiner Tree Problem, following TSPGraphDataset pattern.
-Compatible with both dense and sparse modes.
-"""
+"""Euclidean Steiner tree dataset (dense graphs or kNN-sparsified graphs)."""
 
 import numpy as np
 import torch
-from sklearn.neighbors import KDTree
 from torch_geometric.data import Data as GraphData
+
+from co_datasets.tsp_graph_dataset import knn_indices
 
 
 class SteinerTreeDataset(torch.utils.data.Dataset):
@@ -59,7 +56,7 @@ class SteinerTreeDataset(torch.utils.data.Dataset):
         if ' SEP ' in coords_part:
             terminals_str, candidates_str = coords_part.split(' SEP ')
         else:
-            # Fallback: assume all are terminals (for compatibility)
+            # No candidate Steiner points: all nodes are terminals
             terminals_str = coords_part
             candidates_str = ""
 
@@ -135,9 +132,8 @@ class SteinerTreeDataset(torch.utils.data.Dataset):
             )
         else:
             # Sparse mode with k-NN graph
-            sparse_factor = self.sparse_factor
-            kdt = KDTree(coords, leaf_size=30, metric='euclidean')
-            dis_knn, idx_knn = kdt.query(coords, k=sparse_factor, return_distance=True)
+            sparse_factor = min(self.sparse_factor, n_total)
+            idx_knn = knn_indices(coords, sparse_factor)
 
             # Build edge index
             edge_index_0 = torch.arange(n_total).reshape((-1, 1)).repeat(1, sparse_factor).reshape(-1)
@@ -145,13 +141,8 @@ class SteinerTreeDataset(torch.utils.data.Dataset):
             edge_index = torch.stack([edge_index_0, edge_index_1], dim=0)
 
             # Mark which edges are in the Steiner tree
-            tree_edges = torch.zeros(edge_index.shape[1], dtype=torch.long)
-            for i in range(n_total):
-                for j in range(n_total):
-                    if adjacency[i, j] > 0:
-                        # Find if this edge exists in sparse graph
-                        mask = (edge_index[0] == i) & (edge_index[1] == j)
-                        tree_edges[mask] = 1
+            tree_edges = torch.from_numpy(
+                (adjacency[edge_index[0].numpy(), edge_index[1].numpy()] > 0).astype(np.int64))
 
             # Create PyG graph data
             graph_data = GraphData(

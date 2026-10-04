@@ -1,25 +1,19 @@
-"""Equivariance-preserving native edge-expansion decoder for TSP (T1.4-code).
+"""Feasible probability-only greedy and distance-aware NEE decoders.
 
-Maintains a partial edge set `S_t` and iteratively scores candidate edges using
-only E(2)-invariant quantities (edge probability `P_ij` from the score net,
-pairwise distance `d_ij`, partial edge state `S_ij`, current node degrees, and
-subtour status from a union-find structure). Edges are added one at a time
-subject to feasibility projection (degree at most two, no premature subtour,
-final edge closes a Hamiltonian cycle). Because every input the decoder reads
-is invariant under E(2) and the feasibility projection is purely combinatorial,
-the selected node-index-space tour is unchanged when coordinates are
-translated, rotated, or reflected.
-
-See revision_plan.md (T1.4) and the corresponding section in the manuscript.
+Both operate once on the final clean-edge heatmap. NEE uses
+(P_ij + P_ji) / (2 * (d_ij + epsilon)). Greedy uses only the symmetrized
+probability. Degree and union-find checks are identical, with node-index
+tie breaking. Sparse decoding scores represented edges first and can use
+zero-probability missing edges to complete a feasible cycle.
 """
+
+from itertools import combinations
 
 import numpy as np
 import torch
 
 
 class _UnionFind:
-    """Simple union-find with path compression for subtour detection."""
-
     def __init__(self, n):
         self.parent = list(range(n))
         self.rank = [0] * n
@@ -42,135 +36,162 @@ class _UnionFind:
         return True
 
 
-def native_edge_expansion_decode(edge_probs, distances, return_edges=False):
-    """Decode a Hamiltonian cycle via equivariance-preserving edge expansion.
+def _numpy(value):
+    if torch.is_tensor(value):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value)
 
-    The decoder ranks candidate edges by the invariant score `P_ij / d_ij`
-    (matching the existing greedy decoder's symmetrized form before symmetry
-    breaking), filters candidates by feasibility, and adds edges one at a time
-    until a Hamiltonian cycle is complete. All inputs are E(2)-invariant
-    scalars, and the score, ranking, and feasibility checks operate only on
-    these scalars and the combinatorial state (degree, union-find). The
-    selected edge set therefore depends only on `edge_probs` and `distances`,
-    not on coordinate orientation.
 
-    Args:
-        edge_probs: (n, n) symmetric numpy array or torch tensor of edge
-            probabilities. Diagonal entries are ignored.
-        distances: (n, n) symmetric numpy array or torch tensor of pairwise
-            Euclidean distances. Diagonal entries are ignored.
-        return_edges: if True, return the set of selected edges as a frozen
-            list of sorted (i, j) tuples; otherwise return the cycle as a
-            sequence of node indices starting at 0.
-
-    Returns:
-        Either a list of node indices forming a Hamiltonian cycle (length
-        n + 1, with the last index equal to 0) or a frozenset of selected
-        (i, j) tuples with i < j.
-    """
-    if torch.is_tensor(edge_probs):
-        edge_probs = edge_probs.detach().cpu().numpy()
-    if torch.is_tensor(distances):
-        distances = distances.detach().cpu().numpy()
-
-    edge_probs = np.asarray(edge_probs, dtype=np.float64)
-    distances = np.asarray(distances, dtype=np.float64)
-    n = edge_probs.shape[0]
-    if edge_probs.shape != (n, n) or distances.shape != (n, n):
-        raise ValueError("edge_probs and distances must both be (n, n)")
+def _ranked_cycle(n, candidates, sparse_completion=False):
     if n < 3:
         raise ValueError("Need at least 3 nodes for a Hamiltonian cycle")
-
-    # Symmetrize the edge probability to remove any directional asymmetry the
-    # score net may produce. Combined with the symmetric distance matrix, the
-    # score is then a function of an undirected pair only.
-    P = 0.5 * (edge_probs + edge_probs.T)
-
-    # Invariant edge score: probability per unit distance. Higher is better.
-    iu = np.triu_indices(n, k=1)
-    safe_d = np.where(distances[iu] > 1e-12, distances[iu], 1.0)
-    scores = P[iu] / safe_d
-
-    # Sort candidate edges by score, descending. Ties are broken by
-    # (distance ascending, index ascending) for deterministic output that is
-    # itself invariant under E(2) since both keys depend only on invariant
-    # quantities.
-    order = np.lexsort((iu[1], iu[0], distances[iu], -scores))
-
-    candidates = list(zip(iu[0][order].tolist(), iu[1][order].tolist()))
-
-    degree = [0] * n
-    uf = _UnionFind(n)
-    selected = set()
-
-    for i, j in candidates:
+    degree, uf, selected, inspected = [0] * n, _UnionFind(n), set(), 0
+    phases = [candidates]
+    if sparse_completion:
+        # Unrepresented edges have probability zero. Node-index ordering
+        # preserves the dense decoder's tie rule without an n-by-n allocation.
+        phases.append(combinations(range(n), 2))
+    for phase in phases:
+        for i, j in phase:
+            if len(selected) == n:
+                break
+            i, j = int(i), int(j)
+            inspected += 1
+            if degree[i] >= 2 or degree[j] >= 2 or (i, j) in selected:
+                continue
+            if uf.find(i) == uf.find(j) and len(selected) != n - 1:
+                continue
+            selected.add((i, j))
+            degree[i] += 1
+            degree[j] += 1
+            uf.union(i, j)
         if len(selected) == n:
             break
-        if degree[i] >= 2 or degree[j] >= 2:
-            continue
-        # Closing the cycle is allowed only on the final edge.
-        if uf.find(i) == uf.find(j):
-            if len(selected) == n - 1:
-                selected.add((i, j))
-                degree[i] += 1
-                degree[j] += 1
-                break
-            continue
-        selected.add((i, j))
-        degree[i] += 1
-        degree[j] += 1
-        uf.union(i, j)
+    if len(selected) != n or any(d != 2 for d in degree):
+        raise RuntimeError("Could not construct a Hamiltonian cycle")
+    return frozenset(selected), inspected
 
-    if len(selected) != n:
-        # Fallback: connect dangling endpoints if the candidate sweep finished
-        # before the cycle closed. This preserves invariance because the
-        # fallback selection uses the same invariant scoring restricted to
-        # feasible closure edges.
-        endpoints = [v for v in range(n) if degree[v] < 2]
-        if len(endpoints) != 2:
-            raise RuntimeError(
-                f"Native decoder could not construct a Hamiltonian cycle: "
-                f"{len(selected)} edges selected, {len(endpoints)} dangling endpoints"
-            )
-        a, b = sorted(endpoints)
-        selected.add((a, b))
 
-    if return_edges:
-        return frozenset(selected)
-
-    # Reconstruct the cycle as a node sequence starting at 0.
-    adjacency = {v: [] for v in range(n)}
-    for i, j in selected:
+def _as_tour(n, edges):
+    adjacency = [[] for _ in range(n)]
+    for i, j in edges:
         adjacency[i].append(j)
         adjacency[j].append(i)
-
-    tour = [0]
-    visited = {0}
+    tour, visited = [0], {0}
     while len(tour) < n:
-        current = tour[-1]
-        next_node = None
-        for nb in adjacency[current]:
-            if nb not in visited:
-                next_node = nb
-                break
-        if next_node is None:
-            raise RuntimeError("Tour reconstruction failed: graph is not a single cycle")
-        tour.append(next_node)
-        visited.add(next_node)
-    tour.append(0)
-    return tour
+        available = sorted(v for v in adjacency[tour[-1]] if v not in visited)
+        if not available:
+            raise RuntimeError("Decoded edge set is not a single cycle")
+        tour.append(available[0])
+        visited.add(tour[-1])
+    return tour + [0]
+
+
+def _dense_decode(edge_probs, distances=None, epsilon=1e-8,
+                  return_edges=False, return_stats=False):
+    p = _numpy(edge_probs).astype(np.float64, copy=False)
+    if p.ndim != 2 or p.shape[0] != p.shape[1]:
+        raise ValueError("edge_probs must be a square matrix")
+    if not np.isfinite(p).all() or np.any((p < 0) | (p > 1)):
+        raise ValueError("edge probabilities must be finite and in [0, 1]")
+    n = p.shape[0]
+    iu = np.triu_indices(n, k=1)
+    scores = 0.5 * (p[iu] + p.T[iu])
+    if distances is not None:
+        d = _numpy(distances).astype(np.float64, copy=False)
+        if d.shape != p.shape or not np.isfinite(d).all() or np.any(d < 0):
+            raise ValueError("distances must be finite, nonnegative and match edge_probs")
+        if epsilon <= 0:
+            raise ValueError("epsilon must be positive")
+        scores = scores / (d[iu] + epsilon)
+    order = np.lexsort((iu[1], iu[0], -scores))
+    edges, inspected = _ranked_cycle(n, zip(iu[0][order], iu[1][order]))
+    result = edges if return_edges else _as_tour(n, edges)
+    return (result, inspected) if return_stats else result
+
+
+def native_edge_expansion_decode(edge_probs, distances, return_edges=False,
+                                  epsilon=1e-8, return_stats=False):
+    """NEE with symmetrized probability divided by distance plus epsilon."""
+    return _dense_decode(edge_probs, distances, epsilon, return_edges, return_stats)
+
+
+def greedy_edge_decode(edge_probs, return_edges=False, return_stats=False):
+    """Feasible greedy decoding ranked only by symmetrized probability."""
+    return _dense_decode(edge_probs, return_edges=return_edges, return_stats=return_stats)
+
+
+def _sparse_decode(values, coords, edge_index, decoder, epsilon=1e-8):
+    n = len(coords)
+    src, dst = edge_index
+    if np.any(edge_index < 0) or np.any(edge_index >= n):
+        raise ValueError("edge indices lie outside the coordinate array")
+    if len(values) != len(src) or not np.isfinite(values).all():
+        raise ValueError("invalid sparse edge probabilities")
+    if np.any((values < 0) | (values > 1)):
+        raise ValueError("edge probabilities must be in [0, 1]")
+    # One prediction per directed edge, with absent reverse entries set to 0.
+    directed_keys = src * n + dst
+    if len(np.unique(directed_keys)) != len(directed_keys):
+        raise ValueError("duplicate directed edges are not supported")
+    mask = src != dst
+    lo, hi = np.minimum(src[mask], dst[mask]), np.maximum(src[mask], dst[mask])
+    keys, inverse = np.unique(lo * n + hi, return_inverse=True)
+    scores = np.bincount(inverse, weights=values[mask], minlength=len(keys)) / 2
+    i, j = keys // n, keys % n
+    if decoder == "nee":
+        scores /= np.linalg.norm(coords[i] - coords[j], axis=-1) + epsilon
+    # Zero entries share the same node-index order as all absent edges.
+    keep = scores > 0
+    i, j, scores = i[keep], j[keep], scores[keep]
+    order = np.lexsort((j, i, -scores))
+    edges, inspected = _ranked_cycle(n, zip(i[order], j[order]), sparse_completion=True)
+    return _as_tour(n, edges), inspected
+
+
+def decode_tsp_batch(edge_probs, coords, edge_index=None, sparse_graph=False,
+                     parallel_sampling=1, decoder="nee"):
+    """Decode each heatmap once, for dense batches or one sparse graph.
+
+    Returns tours and the mean number of candidate inspections. Sparse input
+    may contain multiple samples of the same graph, with a shared edge index.
+    """
+    if decoder not in ("greedy", "nee"):
+        raise ValueError("decoder must be greedy or nee")
+    p, c = _numpy(edge_probs), _numpy(coords).astype(np.float64, copy=False)
+    if c.ndim == 2:
+        c = c[None]
+    if c.ndim != 3 or c.shape[-1] != 2 or not np.isfinite(c).all():
+        raise ValueError("coords must be finite and have shape (n,2) or (batch,n,2)")
+    if sparse_graph:
+        ei = _numpy(edge_index).astype(np.int64, copy=False)
+        if ei.ndim != 2 or ei.shape[0] != 2 or ei.shape[1] == 0:
+            raise ValueError("sparse decoding requires edge_index with shape (2,E)")
+        p = p.reshape(-1, ei.shape[1])
+    else:
+        n = c.shape[1]
+        p = p.reshape(-1, n, n)
+    if len(c) not in (1, len(p)):
+        raise ValueError("coordinate and heatmap batch sizes differ")
+    tours, counts = [], []
+    for b, heatmap in enumerate(p):
+        points = c[0 if len(c) == 1 else b]
+        if sparse_graph:
+            tour, inspected = _sparse_decode(heatmap, points, ei, decoder)
+        elif decoder == "greedy":
+            tour, inspected = greedy_edge_decode(heatmap, return_stats=True)
+        else:
+            d = np.linalg.norm(points[:, None] - points[None, :], axis=-1)
+            tour, inspected = native_edge_expansion_decode(heatmap, d, return_stats=True)
+        tours.append(tour)
+        counts.append(inspected)
+    return tours, float(np.mean(counts))
 
 
 def tour_edge_set(tour):
-    """Convert a cycle (list of node indices, possibly closed) to a frozenset
-    of sorted (i, j) tuples for set-equality comparison."""
-    if tour[0] == tour[-1]:
-        seq = tour[:-1]
-    else:
-        seq = tour
-    edges = set()
-    n = len(seq)
-    for k in range(n):
-        a, b = seq[k], seq[(k + 1) % n]
-        edges.add((min(a, b), max(a, b)))
-    return frozenset(edges)
+    """Undirected edge set of a closed or open tour representation."""
+    seq = tour[:-1] if tour[0] == tour[-1] else tour
+    return frozenset(
+        (min(seq[k], seq[(k + 1) % len(seq)]), max(seq[k], seq[(k + 1) % len(seq)]))
+        for k in range(len(seq))
+    )

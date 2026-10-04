@@ -1,328 +1,202 @@
-"""
-PyTorch Lightning module for EDISCO CVRP
-Implements training and evaluation for CVRP with E(2) equivariance
-"""
+"""PyTorch Lightning module for EDISCO on the Capacitated Vehicle Routing Problem."""
 
 import os
+
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from pytorch_lightning.utilities import rank_zero_info
 
 from co_datasets.cvrp_graph_dataset import CVRPGraphDataset
+from models.egnn_encoder_cvrp import EGNNEncoderCVRP
 from pl_meta_model import COMetaModel
 from utils.cvrp_utils import (
-    CVRPEvaluator, decode_cvrp_greedy, batched_decode_cvrp,
-    apply_2opt_cvrp, merge_cvrp_routes
+    CVRPEvaluator, apply_2opt_cvrp, decode_cvrp_greedy, decode_cvrp_nee, merge_cvrp_routes
 )
-from utils.continuous_diffusion import ContinuousTimeCategoricalDiffusion
-from utils.ode_solvers import get_solver, get_time_schedule
 
 
 class CVRPModel(COMetaModel):
+    """Capacity-conditioned E(2)-equivariant diffusion over the edges of a CVRP instance.
+
+    Coordinates are the only equivariant input; demands, the depot indicator
+    and the vehicle capacity enter through invariant channels. Dense graphs
+    are used by default; --sparse_factor k restricts the edge variables to the
+    k-nearest-neighbour graph (used above N = 100).
     """
-    EDISCO model for CVRP
-    Maintains E(2) equivariance through proper separation of coordinates and invariant features
-    """
-    
+
+    # Binary target over node pairs, see CVRPGraphDataset
+    target = 'routes'
+
     def __init__(self, param_args=None):
-        # Initialize parent with node_feature_only=True since we use invariant features
-        super(CVRPModel, self).__init__(param_args=param_args, node_feature_only=True)
-        
-        # Force dense graphs for CVRP (sparse not implemented)
-        self.sparse = False
-        
-        # CVRP-specific configuration
-        self.invariant_dim = 2  # demands + is_depot indicator
+        super().__init__(param_args=param_args)
+
+        self.invariant_dim = 2  # demand and depot indicator
         self.evaluator = CVRPEvaluator()
-        
-        # Replace the model with CVRP-specific encoder if using equivariant architecture
-        if self.equivariant:
-            # Import the CVRP-specific EGNN encoder
-            from models.egnn_encoder_cvrp import EGNNEncoderCVRP
-            
-            # Determine output channels based on diffusion type
-            if self.continuous_time:
-                out_channels = 2  # for categorical diffusion
-            else:
-                if self.diffusion_type == 'gaussian':
-                    out_channels = 1
-                elif self.diffusion_type == 'categorical':
-                    out_channels = 2
-                else:
-                    out_channels = 2
-            
-            # Replace the model with CVRP version
-            self.model = EGNNEncoderCVRP(
-                n_layers=self.args.n_layers,
-                hidden_dim=self.args.hidden_dim,
-                node_dim=getattr(self.args, 'node_dim', 64),
-                edge_dim=getattr(self.args, 'edge_dim', 64),
-                time_dim=getattr(self.args, 'time_dim', 128),  # Add time_dim as independent parameter
-                coord_dim=getattr(self.args, 'coord_dim', 2),
-                invariant_dim=self.invariant_dim,  # CVRP-specific: demands + is_depot
-                out_channels=out_channels,
-                num_classes=2,  # binary adjacency matrix
-                sparse=False,  # CVRP only uses dense graphs
-                use_activation_checkpoint=self.args.use_activation_checkpoint,
-                coord_update_alpha=getattr(self.args, 'coord_update_alpha', 0.1),
-                weight_temp=getattr(self.args, 'weight_temp', 10.0)
+
+        # The training set is only needed for training.
+        def load(split):
+            return CVRPGraphDataset(
+                data_file=os.path.join(self.args.storage_path, split),
+                sparse_factor=self.args.sparse_factor,
+                target=self.target,
             )
-            
-            rank_zero_info(f"Initialized EGNNEncoderCVRP with time_dim={getattr(self.args, 'time_dim', 128)}, "
-                          f"hidden_dim={self.args.hidden_dim}, node_dim={getattr(self.args, 'node_dim', 64)}, "
-                          f"edge_dim={getattr(self.args, 'edge_dim', 64)}")
-            rank_zero_info("Replaced EGNNEncoder with EGNNEncoderCVRP for CVRP-specific equivariant processing")
-            
-            # Optionally reinitialize node embedding for CVRP invariant features
-            # This is now handled internally by EGNNEncoderCVRP, but we can still call it
-            self._reinit_node_embedding()
-        
-        # Load datasets (force dense graphs for CVRP)
-        self.train_dataset = CVRPGraphDataset(
-            data_file=os.path.join(self.args.storage_path, self.args.training_split),
-            sparse_factor=0,  # Force dense graphs
-        )
-        
-        self.test_dataset = CVRPGraphDataset(
-            data_file=os.path.join(self.args.storage_path, self.args.test_split),
-            sparse_factor=0,  # Force dense graphs
-        )
-        
-        self.validation_dataset = CVRPGraphDataset(
-            data_file=os.path.join(self.args.storage_path, self.args.validation_split),
-            sparse_factor=0,  # Force dense graphs
-        )
-        
-        # Extract problem info
-        self.n_customers = self.train_dataset.n_customers
-        self.n_nodes = self.train_dataset.n_nodes
-        self.capacity = self.train_dataset.capacity
-        
-        rank_zero_info(f"Initialized CVRP Model - Customers: {self.n_customers}, Capacity: {self.capacity}")
-    
-    def _reinit_node_embedding(self):
-        """Reinitialize node embedding for CVRP invariant features"""
-        if hasattr(self.model, 'node_embed'):
-            # For EGNN, modify the input dimension to match CVRP features
-            import torch.nn as nn
-            self.model.node_embed = nn.Sequential(
-                nn.Linear(self.invariant_dim, self.model.node_dim),
-                nn.LayerNorm(self.model.node_dim),
-                nn.SiLU(),
-                nn.Linear(self.model.node_dim, self.model.node_dim)
-            )
-            rank_zero_info(f"Reinitialized node embedding for CVRP invariant features (dim={self.invariant_dim})")
-    
-    def forward(self, coords, invariant_features, adj_matrix, t, edge_index=None):
-        """
-        Forward pass for CVRP
-        
+        self.train_dataset = load(self.args.training_split) if getattr(self.args, 'do_train', True) else None
+        self.test_dataset = load(self.args.test_split)
+        self.validation_dataset = load(self.args.validation_split)
+
+        reference = self.train_dataset or self.validation_dataset
+        self.n_customers = reference.n_customers
+        self.n_nodes = reference.n_nodes
+        self.capacity = reference.capacity
+
+        # Capacity conditioning (invariant capacity features and FiLM on the
+        # scalar messages) is disabled only for the unconditioned variants of
+        # the capacity-shift study.
+        self.capacity_conditioning = not getattr(self.args, 'disable_capacity_conditioning', False)
+        reference_capacity = getattr(self.args, 'default_capacity', None)
+        self.model = EGNNEncoderCVRP(
+            n_layers=self.args.n_layers, hidden_dim=self.args.hidden_dim,
+            node_dim=getattr(self.args, 'node_dim', 64),
+            edge_dim=getattr(self.args, 'edge_dim', 64),
+            time_dim=getattr(self.args, 'time_dim', 128),
+            invariant_dim=self.invariant_dim, out_channels=2,
+            default_capacity=self.capacity if reference_capacity is None else reference_capacity,
+            capacity_conditioning=self.capacity_conditioning,
+            use_activation_checkpoint=self.args.use_activation_checkpoint,
+            sparse=self.sparse,
+            coord_update_alpha=getattr(self.args, 'coord_update_alpha', 0.1),
+            weight_temp=getattr(self.args, 'weight_temp', 10.0))
+
+        rank_zero_info(f"{self.__class__.__name__}: {self.n_customers} customers, capacity {self.capacity}, "
+                       f"capacity conditioning: {self.capacity_conditioning}")
+
+    @property
+    def eval_batch_size(self):
+        return self.args.batch_size
+
+    def forward(self, coords, invariant_features, adj_matrix, t, edge_index=None,
+                capacity=None, demands=None, node_batch=None):
+        """Clean-edge logits.
+
         Args:
-            coords: Node coordinates (batch_size, n_nodes, 2) - equivariant
-            invariant_features: Demands + is_depot (batch_size, n_nodes, 2) - invariant
-            adj_matrix: Adjacency matrix (batch_size, n_nodes, n_nodes)
-            t: Time steps
-            edge_index: Not used for CVRP (dense only)
+            coords: node coordinates (batch_size, n_nodes, 2), or (N, 2) in sparse mode
+            invariant_features: demand and depot indicator, same leading shape as coords
+            adj_matrix: noisy edge state (batch_size, n_nodes, n_nodes), or (E,) in sparse mode
+            t: one diffusion time per instance
+            edge_index: (2, E) candidate edges in sparse mode
+            capacity: vehicle capacity per instance, (batch_size,) or (batch_size, 1)
+            node_batch: (N,) instance index of every node in sparse mode
         """
-        if self.equivariant:
-            # EGNN expects coordinates and invariant features separately
-            # Check if the model has forward_cvrp method (it should with EGNNEncoderCVRP)
-            if hasattr(self.model, 'forward_cvrp'):
-                return self.model.forward_cvrp(coords, invariant_features, adj_matrix, t)
-            else:
-                # Fallback for standard EGNN
-                rank_zero_info("Warning: Using fallback forward method. Check model initialization.")
-                return self.model(invariant_features, t, coords, adj_matrix)
-        else:
-            # Standard GNN uses only invariant features
-            return self.model(invariant_features, t, adj_matrix)
-    
+        if capacity is None:
+            raise ValueError('capacity must be supplied to the CVRP encoder')
+        if demands is None:
+            demands = invariant_features[..., 0]
+        return self.model(coords, demands, capacity.reshape(-1),
+                          invariant_features, adj_matrix, t, edge_index, node_batch)
+
+    def _unpack_batch(self, batch):
+        """Bring dense and sparse batches to one set of named tensors."""
+        if self.sparse:
+            graph, capacity, reference = batch
+            batch_size = capacity.shape[0]
+            return dict(
+                coords=graph.x, invariant=graph.invariant, demands=graph.demands,
+                capacity=capacity.reshape(-1), reference=reference.reshape(-1),
+                target=graph.edge_attr.reshape(batch_size, -1).float(),
+                edge_index=graph.edge_index, node_batch=graph.batch, batch_size=batch_size)
+        coords, invariant_features, target, capacity, demands, reference = batch
+        return dict(
+            coords=coords, invariant=invariant_features, demands=demands,
+            capacity=capacity.reshape(-1), reference=reference.reshape(-1),
+            target=target, edge_index=None, node_batch=None, batch_size=coords.shape[0])
+
+    def _predict_x0_logits(self, b, xt, t):
+        """Clean-state logits for the noisy state `xt`, in the shape of `xt`."""
+        return self.forward(b['coords'], b['invariant'], xt, t, b['edge_index'],
+                            capacity=b['capacity'], demands=b['demands'], node_batch=b['node_batch'])
+
     def training_step(self, batch, batch_idx):
-        """Main training step that routes to appropriate diffusion-specific method"""
-        if self.diffusion_type == 'categorical' or self.continuous_time:
-            return self.categorical_training_step(batch, batch_idx)
-        elif self.diffusion_type == 'gaussian':
-            # If you have Gaussian diffusion, implement gaussian_training_step
-            # For now, fallback to categorical
-            return self.categorical_training_step(batch, batch_idx)
-        else:
-            raise ValueError(f"Unknown diffusion type: {self.diffusion_type}")
-    
-    def categorical_training_step(self, batch, batch_idx):
-        """Training step for CVRP with categorical diffusion"""
-        # CVRP only uses dense graphs
-        coords, invariant_features, adj_matrix, capacity, demands = batch
-        batch_size = coords.shape[0]
-        device = coords.device
-        
-        if self.continuous_time:
-            t = torch.rand(batch_size, device=device)
-            xt = self.diffusion.sample_forward(adj_matrix, t, device)
-            logits = self.forward(coords, invariant_features, xt, t)
-            loss = self.diffusion.elbo_loss(adj_matrix, xt, t, logits)
-        else:
-            t = np.random.randint(1, self.diffusion.T + 1, batch_size)
-            t = torch.from_numpy(t).long().to(device)
-            xt = self.diffusion.sample(adj_matrix.unsqueeze(-1), t).squeeze(-1)
-            logits = self.forward(coords, invariant_features, xt, t)
-            loss = self.diffusion.loss(logits, adj_matrix.long(), xt, t)
-        
-        self.log('train/loss', loss, prog_bar=True)
+        b = self._unpack_batch(batch)
+        batch_size, target = b['batch_size'], b['target']
+
+        # t ~ U(0, 1), X_t ~ q(X_t | X_0)
+        t = torch.rand(batch_size, device=target.device)
+        xt = self.diffusion.sample_forward(target, t)
+
+        # x0 prediction and (1 - sqrt(t))-weighted cross-entropy
+        logits = self._predict_x0_logits(b, xt.reshape(-1) if self.sparse else xt, t)
+        loss = self.diffusion.loss(target, t, logits.reshape(batch_size, -1, 2))
+
+        self.log('train/loss', loss, prog_bar=True, batch_size=batch_size)
         return loss
-    
-    def validation_step(self, batch, batch_idx):
-        return self.test_step(batch, batch_idx, split='val')
-    
+
+    @torch.no_grad()
+    def sample_heatmap(self, b):
+        """Reverse CTMC sampling; returns final probabilities shaped like the target."""
+        device = b['target'].device
+        batch_size = b['batch_size']
+        shape = (b['target'].numel(),) if self.sparse else tuple(b['target'].shape)
+
+        def score_fn(x, t):
+            return self._predict_x0_logits(b, x, torch.full((batch_size,), float(t), device=device))
+
+        # X_{t_0} ~ Uniform({0, 1})
+        x_T = torch.randint(0, 2, shape, device=device).float()
+        probs = self.build_solver().sample(score_fn, x_T, schedule=self.args.time_schedule)
+        return probs.reshape(batch_size, -1) if self.sparse else probs
+
+    def decode_instance(self, probs, coords, demands, capacity, edge_index=None):
+        """Feasibility projection of one heatmap onto capacity-feasible routes."""
+        decode = decode_cvrp_greedy if getattr(self.args, 'decoder', 'nee') == 'greedy' else decode_cvrp_nee
+        return decode(probs, coords, demands, capacity, edge_index=edge_index)
+
     def test_step(self, batch, batch_idx, split='test'):
-        """Evaluation step for CVRP"""
-        # CVRP only uses dense graphs
-        coords, invariant_features, adj_matrix, capacity_batch, demands = batch
-        batch_size = coords.shape[0]
-        
-        # Sample solutions using reverse diffusion
-        solutions = self.sample_solutions(
-            coords, invariant_features, capacity_batch, 
-            n_steps=self.args.solver_steps if self.continuous_time else self.args.inference_diffusion_steps
-        )
-        
-        # Evaluate solutions
-        gaps = []
-        distances = []
-        n_routes_list = []
-        
-        for b in range(batch_size):
-            coords_b = coords[b].cpu().numpy()
-            demands_b = demands[b].cpu().numpy()
-            
-            routes = solutions[b]
-            
-            # Apply 2-opt if enabled
+        b = self._unpack_batch(batch)
+        batch_size = b['batch_size']
+        start = self.wall_clock()
+        probs = self.sample_heatmap(b).cpu()
+
+        coords, demands = b['coords'].cpu(), b['demands'].cpu()
+        if self.sparse:
+            # nodes and edges of each instance are contiguous in the batch
+            n_nodes = coords.shape[0] // batch_size
+            n_edges = b['edge_index'].shape[1] // batch_size
+            coords = coords.reshape(batch_size, n_nodes, 2)
+            demands = demands.reshape(batch_size, n_nodes)
+            edge_index = b['edge_index'].cpu().reshape(2, batch_size, n_edges)
+
+        distances, n_routes, gaps = [], [], []
+        for i in range(batch_size):
+            capacity_i = float(b['capacity'][i])
+            local_edges = None if not self.sparse else edge_index[:, i] - i * n_nodes
+            routes = self.decode_instance(probs[i], coords[i], demands[i], capacity_i, local_edges)
+            coords_i, demands_i = coords[i].numpy(), demands[i].numpy()
+
+            # Optional 2-opt within routes (reference comparisons only)
             if self.args.two_opt_iterations > 0:
-                routes = apply_2opt_cvrp(routes, coords_b, self.args.two_opt_iterations)
-            
-            # Try to merge routes
-            if hasattr(self.args, 'merge_routes') and self.args.merge_routes:
-                routes = merge_cvrp_routes(routes, demands_b, self.capacity)
-            
-            # Compute metrics
-            distance = self.evaluator.compute_total_distance(coords_b, routes)
+                routes = apply_2opt_cvrp(routes, coords_i, self.args.two_opt_iterations)
+
+            # Optional route merging
+            if getattr(self.args, 'merge_routes', False):
+                routes = merge_cvrp_routes(routes, demands_i, capacity_i)
+
+            distance = self.evaluator.compute_total_distance(coords_i, routes)
             distances.append(distance)
-            n_routes_list.append(len(routes))
-            
-            # Compute gap if ground truth is available
-            if hasattr(self, f'{split}_dataset'):
-                dataset = getattr(self, f'{split}_dataset')
-                instance_idx = batch_idx * len(coords) + b
-                if instance_idx < len(dataset):
-                    info = dataset.get_instance_info(instance_idx)
-                    if 'optimal_distance' in info and info['optimal_distance']:
-                        gap = (distance - info['optimal_distance']) / info['optimal_distance'] * 100
-                        gaps.append(gap)
-        
-        # Log metrics
-        avg_distance = np.mean(distances)
-        avg_routes = np.mean(n_routes_list)
-        
-        self.log(f'{split}/distance', avg_distance, prog_bar=True)
-        self.log(f'{split}/n_routes', avg_routes)
-        
+            n_routes.append(len(routes))
+
+            # Gap to the reference solution when one is stored with the instance
+            reference_i = float(b['reference'][i])
+            if np.isfinite(reference_i) and reference_i > 0:
+                gaps.append((distance - reference_i) / reference_i * 100)
+
+        metrics = {
+            f'{split}/solved_cost': float(np.mean(distances)),
+            f'{split}/n_routes': float(np.mean(n_routes)),
+            # sampling, decoding and optional post-processing, per instance
+            f'{split}/time': (self.wall_clock() - start) / batch_size,
+        }
         if gaps:
-            avg_gap = np.mean(gaps)
-            self.log(f'{split}/gap', avg_gap, prog_bar=True)
-            self.log(f'{split}/solved_cost', avg_gap)  # For compatibility with checkpoint monitoring
-        
-        return {'distance': avg_distance, 'gap': np.mean(gaps) if gaps else 0.0}
-    
-    def sample_solutions(self, coords, invariant_features, capacity_batch, n_steps=50):
-        """
-        Sample CVRP solutions using reverse diffusion
-        """
-        device = coords.device
-        batch_size, n_nodes, _ = coords.shape
-        
-        # Initialize with noise
-        if self.continuous_time:
-            xt = torch.randint(0, 2, (batch_size, n_nodes, n_nodes), device=device).float()
-        else:
-            xt = torch.randint(0, self.diffusion.num_classes, 
-                             (batch_size, n_nodes, n_nodes), device=device).float()
-        
-        # Reverse diffusion
-        if self.continuous_time:
-            # Use ODE solver for continuous-time with beta parameters
-            beta_min = getattr(self.args, 'beta_min', 0.1)
-            beta_max = getattr(self.args, 'beta_max', 1.5)
-            solver = get_solver(self.args.solver_type, num_steps=n_steps,
-                               beta_min=beta_min, beta_max=beta_max)
-            
-            def score_fn(x, t):
-                t_batch = torch.full((batch_size,), t, device=device)
-                logits = self.forward(coords, invariant_features, x, t_batch)
-                return logits  # Return logits for solvers to process
-            
-            # Run solver to get edge probabilities
-            adj_probs = solver.sample(score_fn, xt, device=device, schedule=self.args.time_schedule)
-        else:
-            # Discrete-time reverse process
-            schedule = self.diffusion.get_inference_schedule(n_steps)
-            
-            for t in reversed(schedule):
-                t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
-                logits = self.forward(coords, invariant_features, xt, t_batch)
-                
-                if t > 1:
-                    xt = self.diffusion.sample_reverse(xt, logits, t_batch)
-                else:
-                    adj_probs = F.softmax(logits, dim=-1)[..., 1]
-                    xt = adj_probs
-        
-        # Decode to routes
-        coords_cpu = coords.cpu()
-        demands_cpu = invariant_features[..., 0].cpu()  # First column is demands
-        capacity_cpu = capacity_batch.cpu()
-        
-        solutions = batched_decode_cvrp(
-            adj_probs.cpu(), coords_cpu, demands_cpu, capacity_cpu,
-            decode_type='greedy'
-        )
-        
-        return solutions
-    
-    def configure_optimizers(self):
-        """Use parent's optimizer configuration"""
-        return super().configure_optimizers()
-    
-    def train_dataloader(self):
-        """Return training dataloader"""
-        return torch.utils.data.DataLoader(
-            self.train_dataset,
-            batch_size=self.args.batch_size,
-            shuffle=True,
-            num_workers=getattr(self.args, 'num_workers', 16),
-            pin_memory=True,
-            drop_last=True
-        )
-    
-    def val_dataloader(self):
-        """Return validation dataloader"""
-        return torch.utils.data.DataLoader(
-            self.validation_dataset,
-            batch_size=self.args.batch_size,
-            shuffle=False,
-            num_workers=getattr(self.args, 'num_workers', 16),
-            pin_memory=True,
-            drop_last=False
-        )
-    
-    def test_dataloader(self):
-        """Return test dataloader"""
-        return torch.utils.data.DataLoader(
-            self.test_dataset,
-            batch_size=self.args.batch_size,
-            shuffle=False,
-            num_workers=getattr(self.args, 'num_workers', 16),
-            pin_memory=True,
-            drop_last=False
-        )
+            metrics[f'{split}/gap'] = float(np.mean(gaps))
+        for key, value in metrics.items():
+            self.log(key, value, on_epoch=True, sync_dist=True, batch_size=batch_size,
+                     prog_bar=key.endswith('gap'))
+        return metrics

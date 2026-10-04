@@ -1,19 +1,18 @@
-"""Utilities for Euclidean Steiner Tree Problem
+"""Euclidean Steiner tree utilities: evaluation, feasible decoding and reference solvers.
 
-Includes:
-- Tree evaluation (compute total length)
-- Decoding from adjacency probabilities to trees
-- Baseline solvers (MST, 1-Steiner, GeoSteiner)
+The reference solvers (GeoSteiner, iterated 1-Steiner and the minimum spanning
+tree) are used by data/generate_steiner_data.py to label instances.
 """
+
+import os
+import re
+import subprocess
+import tempfile
 
 import numpy as np
 import torch
 from scipy.sparse.csgraph import minimum_spanning_tree
 from scipy.spatial import distance_matrix
-import subprocess
-import tempfile
-import os
-import re
 
 
 class SteinerTreeEvaluator:
@@ -98,21 +97,31 @@ class SteinerTreeEvaluator:
         return True, "Valid tree"
 
 
-def decode_steiner_tree(adj_probs, coords, is_terminal, threshold=0.5):
+def decode_steiner_tree(adj_probs, coords, is_terminal, epsilon=1e-8):
     """
-    Decode adjacency probabilities to a Steiner tree
+    Tree-aware greedy decoding of edge probabilities into a Steiner tree.
 
-    Strategy:
-    1. Extract high-probability edges
-    2. Use Kruskal-like algorithm to build tree (no cycles)
-    3. Ensure all terminals are connected
-    4. Remove unused Steiner points
+    Kruskal-style procedure on the symmetrized score
+    s_ij = (P_ij + P_ji) / (d_ij + epsilon):
+
+    1. Candidate edges are scanned in decreasing score (ties by node index).
+       An edge is added when it joins two distinct components, until all
+       terminals lie in one component.
+    2. Any terminal still disconnected once the scored candidates are
+       exhausted is attached through the shortest edge that joins two
+       components, which guarantees feasibility.
+    3. Steiner points are kept only when they act as connection hubs:
+       edges outside the terminal component and Steiner leaves are removed,
+       and a Steiner point of degree two is replaced by the direct edge
+       between its neighbours, which never increases the length.
+
+    Every quantity read (probabilities, pairwise distances, the terminal
+    indicator, component membership) is invariant under E(2).
 
     Args:
         adj_probs: (n, n) edge probabilities
         coords: (n, 2) node coordinates
         is_terminal: (n,) binary indicator (1 for terminals)
-        threshold: Probability threshold for edge inclusion
 
     Returns:
         adjacency: (n, n) decoded adjacency matrix
@@ -123,87 +132,91 @@ def decode_steiner_tree(adj_probs, coords, is_terminal, threshold=0.5):
     if isinstance(coords, torch.Tensor):
         coords = coords.cpu().numpy()
     if isinstance(is_terminal, torch.Tensor):
-        is_terminal = is_terminal.cpu().numpy().flatten()
+        is_terminal = is_terminal.cpu().numpy()
+    adj_probs = np.asarray(adj_probs, dtype=np.float64)
+    coords = np.asarray(coords, dtype=np.float64)
+    terminal = np.asarray(is_terminal).reshape(-1) > 0.5
 
     n = len(coords)
-    n_terminals = int(np.sum(is_terminal))
+    n_terminals = int(terminal.sum())
+    distances = np.linalg.norm(coords[:, None] - coords[None, :], axis=-1)
 
-    # Make symmetric
-    adj_probs_sym = (adj_probs + adj_probs.T) / 2.0
-
-    # Extract candidate edges with probabilities
-    edges = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            prob = adj_probs_sym[i, j]
-            if prob > threshold:
-                length = np.linalg.norm(coords[i] - coords[j])
-                edges.append((prob, length, i, j))
-
-    # Sort by probability (descending), then by length (ascending)
-    edges.sort(key=lambda x: (-x[0], x[1]))
-
-    # Kruskal's algorithm with union-find
     parent = list(range(n))
+    terminals_in = terminal.astype(int).tolist()  # terminals per component root
 
     def find(x):
-        if parent[x] != x:
-            parent[x] = find(parent[x])
-        return parent[x]
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
 
-    def union(x, y):
-        px, py = find(x), find(y)
-        if px != py:
-            parent[px] = py
-            return True
-        return False
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        parent[rj] = ri
+        terminals_in[ri] += terminals_in[rj]
+        return terminals_in[ri]
 
-    # Build tree
-    selected_edges = []
-    for prob, length, i, j in edges:
-        if union(i, j):
-            selected_edges.append((i, j))
-            if len(selected_edges) >= n - 1:
-                break
+    edges = set()
+    connected = n_terminals <= 1
 
-    # Create adjacency matrix
+    # 1. Kruskal-style scan in decreasing score
+    iu = np.triu_indices(n, k=1)
+    scores = (adj_probs[iu] + adj_probs.T[iu]) / (distances[iu] + epsilon)
+    order = np.lexsort((iu[1], iu[0], -scores))
+    for k in order:
+        if connected or scores[k] <= 0:
+            break
+        i, j = int(iu[0][k]), int(iu[1][k])
+        if find(i) != find(j):
+            edges.add((i, j))
+            connected = union(i, j) == n_terminals
+
+    # 2. Attach terminals that are still disconnected
+    while not connected:
+        roots = np.array([find(v) for v in range(n)])
+        has_terminal = np.array([terminals_in[r] > 0 for r in roots])
+        feasible = (roots[:, None] != roots[None, :]) & has_terminal[:, None] & has_terminal[None, :]
+        masked = np.where(feasible, distances, np.inf)
+        i, j = np.unravel_index(np.argmin(masked), masked.shape)
+        i, j = (int(i), int(j)) if i < j else (int(j), int(i))
+        edges.add((i, j))
+        connected = union(i, j) == n_terminals
+
+    # 3. Keep Steiner points only as connection hubs
+    if n_terminals > 0:
+        root = find(int(np.argmax(terminal)))
+        edges = {(i, j) for i, j in edges if find(i) == root}
+    neighbours = [set() for _ in range(n)]
+    for i, j in edges:
+        neighbours[i].add(j)
+        neighbours[j].add(i)
+    changed = True
+    while changed:
+        changed = False
+        for v in range(n):
+            if terminal[v]:
+                continue
+            if len(neighbours[v]) == 1:
+                (u,) = neighbours[v]
+                neighbours[u].discard(v)
+                neighbours[v].clear()
+                changed = True
+            elif len(neighbours[v]) == 2:
+                u, w = neighbours[v]
+                neighbours[u].discard(v)
+                neighbours[w].discard(v)
+                neighbours[u].add(w)
+                neighbours[w].add(u)
+                neighbours[v].clear()
+                changed = True
+
     adjacency = np.zeros((n, n), dtype=np.float32)
-    for i, j in selected_edges:
-        adjacency[i, j] = 1.0
-        adjacency[j, i] = 1.0
-
-    # Compute tree length
-    evaluator = SteinerTreeEvaluator()
-    tree_length = evaluator.compute_tree_length(coords, adjacency)
+    for v in range(n):
+        for u in neighbours[v]:
+            adjacency[v, u] = 1.0
+    tree_length = float((adjacency * distances).sum() / 2.0)
 
     return adjacency, tree_length
-
-
-def merge_steiner_trees(adj_probs_batch, coords_batch, is_terminal_batch, threshold=0.5):
-    """
-    Batch version of decode_steiner_tree
-
-    Args:
-        adj_probs_batch: (batch_size, n, n) probabilities
-        coords_batch: (batch_size, n, 2) coordinates
-        is_terminal_batch: (batch_size, n) indicators
-
-    Returns:
-        trees: List of (adjacency, length) tuples
-    """
-    batch_size = len(adj_probs_batch)
-    trees = []
-
-    for b in range(batch_size):
-        adj, length = decode_steiner_tree(
-            adj_probs_batch[b],
-            coords_batch[b],
-            is_terminal_batch[b],
-            threshold=threshold
-        )
-        trees.append((adj, length))
-
-    return trees
 
 
 # ============================================================================

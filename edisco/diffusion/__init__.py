@@ -1,6 +1,1 @@
-"""Diffusion utilities for EDISCO."""
-
-from .exact_ctmc import ExactCTMCPosterior
-from .continuous_categorical import ContinuousTimeCategoricalDiffusion
-
-__all__ = ['ExactCTMCPosterior', 'ContinuousTimeCategoricalDiffusion']
+"""Continuous-time categorical diffusion: forward process, exact posterior and solvers."""

@@ -1,333 +1,276 @@
-"""Lightning module for training TSP models (both DIFUSCO and EDISCO compatible)."""
+"""PyTorch Lightning module for EDISCO on the Travelling Salesman Problem."""
 
 import os
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.data
-from pytorch_lightning.utilities import rank_zero_info
 
 from co_datasets.tsp_graph_dataset import TSPGraphDataset
+from models.egnn_encoder import EGNNEncoder
+from models.gnn_encoder import GNNEncoder
 from pl_meta_model import COMetaModel
-from utils.diffusion_schedulers import InferenceSchedule, ContinuousTimeSchedule
-from utils.tsp_utils import TSPEvaluator, batched_two_opt_torch, merge_tours
+from utils.equivariance_utils import random_e2_transform
+from utils.native_decoder import decode_tsp_batch
+from utils.tsp_utils import TSPEvaluator, batched_two_opt_torch
+
+
+class NonEquivariantScoreNetwork(nn.Module):
+    """Adapter giving the non-equivariant GNN the EGNN call signature.
+
+    Used for the encoder-substitution ablation: the anisotropic GNN reads
+    raw coordinates, so its edge logits depend on the coordinate frame.
+    """
+
+    def __init__(self, gnn, sparse):
+        super().__init__()
+        self.gnn = gnn
+        self.sparse = sparse
+
+    def forward(self, coords, adj_matrix, timesteps, edge_index=None):
+        timesteps = timesteps.reshape(-1)
+        if self.sparse:
+            coords = coords.reshape(-1, coords.shape[-1])
+            adj = adj_matrix.reshape(-1).float()
+            if timesteps.shape[0] == 1:
+                timesteps = timesteps.expand(adj.shape[0])
+            return self.gnn(coords, timesteps, adj, edge_index)
+        if coords.dim() == 2:
+            coords = coords.unsqueeze(0)
+        batch_size, n_nodes, _ = coords.shape
+        if timesteps.shape[0] == 1 and batch_size > 1:
+            timesteps = timesteps.expand(batch_size)
+        adj = adj_matrix.reshape(batch_size, n_nodes, n_nodes).float()
+        logits = self.gnn(coords, timesteps, adj, None)
+        return logits.permute(0, 2, 3, 1)
 
 
 class TSPModel(COMetaModel):
-    """TSP Model compatible with both DIFUSCO and EDISCO architectures"""
-    
+    """E(2)-equivariant categorical diffusion over the edges of a TSP instance."""
+
     def __init__(self, param_args=None):
-        super(TSPModel, self).__init__(param_args=param_args, node_feature_only=False)
-        
-        self.train_dataset = TSPGraphDataset(
-            data_file=os.path.join(self.args.storage_path, self.args.training_split),
-            sparse_factor=self.args.sparse_factor,
-        )
-        
-        self.test_dataset = TSPGraphDataset(
-            data_file=os.path.join(self.args.storage_path, self.args.test_split),
-            sparse_factor=self.args.sparse_factor,
-        )
-        
-        self.validation_dataset = TSPGraphDataset(
-            data_file=os.path.join(self.args.storage_path, self.args.validation_split),
-            sparse_factor=self.args.sparse_factor,
-        )
-        
-        # Check if using continuous-time
-        self.is_continuous = getattr(self.args, 'continuous_time', False)
-        self.is_equivariant = getattr(self.args, 'equivariant', False)
-    
-    def forward(self, x, adj, t, edge_index=None):
-        if self.is_equivariant:
-            # EGNN forward (coordinates, adjacency, time)
-            return self.model(x, adj, t, edge_index)
+        super().__init__(param_args=param_args)
+
+        if getattr(self.args, 'disable_equivariance', False):
+            # Encoder ablation: the non-equivariant GNN with matched depth and width.
+            gnn = GNNEncoder(
+                n_layers=self.args.n_layers, hidden_dim=self.args.hidden_dim,
+                out_channels=2, sparse=self.sparse,
+                use_activation_checkpoint=self.args.use_activation_checkpoint)
+            self.model = NonEquivariantScoreNetwork(gnn, self.sparse)
         else:
-            # Standard GNN forward (features, time, adjacency, edge_index)
-            return self.model(x, t, adj, edge_index)
-    
-    def categorical_training_step(self, batch, batch_idx):
-        edge_index = None
-        if not self.sparse:
-            _, points, adj_matrix, _ = batch
-            if self.is_continuous:
-                # Sample continuous time uniformly in [0, 1]
-                batch_size = points.shape[0]
-                t = torch.rand(batch_size).to(points.device)
-            else:
-                t = np.random.randint(1, self.diffusion.T + 1, points.shape[0]).astype(int)
-        else:
-            _, graph_data, point_indicator, edge_indicator, _ = batch
-            if self.is_continuous:
-                batch_size = point_indicator.shape[0]
-                t = torch.rand(batch_size).to(graph_data.x.device)
-            else:
-                t = np.random.randint(1, self.diffusion.T + 1, point_indicator.shape[0]).astype(int)
-            route_edge_flags = graph_data.edge_attr
-            points = graph_data.x
-            edge_index = graph_data.edge_index
-            num_edges = edge_index.shape[1]
+            self.model = EGNNEncoder.from_args(self.args)
+
+        # The training set is only needed for training.
+        def load(split):
+            return TSPGraphDataset(
+                data_file=os.path.join(self.args.storage_path, split),
+                sparse_factor=self.args.sparse_factor)
+        self.train_dataset = load(self.args.training_split) if getattr(self.args, 'do_train', True) else None
+        self.test_dataset = load(self.args.test_split)
+        self.validation_dataset = load(self.args.validation_split)
+
+        # Symmetry ablations for the non-equivariant encoder
+        self.data_augmentation = getattr(self.args, 'data_augmentation', 'none')
+        self.symmetry_loss = getattr(self.args, 'symmetry_loss', False)
+        self.symmetry_loss_weight = getattr(self.args, 'symmetry_loss_weight', 1.0)
+
+    def forward(self, coords, adj_matrix, timesteps, edge_index=None):
+        """Clean-edge logits from coordinates and a noisy edge state."""
+        return self.model(coords, adj_matrix, timesteps, edge_index)
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
+    def _unpack_batch(self, batch):
+        """Return coords, clean edge state (B, ...), edge_index and node->graph index."""
+        if self.sparse:
+            _, graph_data, point_indicator, _, _ = batch
             batch_size = point_indicator.shape[0]
-            adj_matrix = route_edge_flags.reshape((batch_size, num_edges // batch_size))
-        
-        # Sample from diffusion
-        if self.is_continuous:
-            # Continuous-time sampling
-            xt = self.diffusion.sample_forward(adj_matrix, t, points.device)
-        else:
-            # Discrete-time sampling
-            adj_matrix_onehot = F.one_hot(adj_matrix.long(), num_classes=2).float()
-            if self.sparse:
-                adj_matrix_onehot = adj_matrix_onehot.reshape((batch_size * num_edges // batch_size, 2))
-            else:
-                adj_matrix_onehot = adj_matrix_onehot.unsqueeze(1).unsqueeze(1)
-            t = torch.from_numpy(t).long()
-            if self.sparse:
-                t = t.repeat_interleave(edge_indicator.reshape(-1).cpu(), dim=0).numpy()
-            xt = self.diffusion.sample(adj_matrix_onehot, t)
-        
-        # Forward pass
-        if self.is_continuous:
-            # Continuous-time forward
-            if self.is_equivariant:
-                pred = self.forward(points, xt, t, edge_index)
-            else:
-                pred = self.model(points, t, xt, edge_index)
-            
-            # Compute continuous-time loss
-            loss = self.diffusion.elbo_loss(adj_matrix, xt, t, pred)
-        else:
-            # Discrete-time forward (original DIFUSCO)
-            xt = xt * 2 - 1
-            xt = xt * (1.0 + 0.05 * torch.rand_like(xt))
-            
-            if not self.sparse:
-                pred = self.model(points, xt, t, edge_index)
-            else:
-                points = points.repeat(batch_size, 1)
-                xt = xt.reshape((batch_size * edge_indicator[-1], 2))
-                pred = self.model(points, xt, t, edge_index)
-            
-            # Compute discrete-time loss
-            loss = F.cross_entropy(
-                pred.view(-1, 2),
-                adj_matrix.reshape(-1).long()
-            )
-        
-        self.log("train/loss", loss, prog_bar=True)
-        return loss
-    
-    def gaussian_training_step(self, batch, batch_idx):
-        """Gaussian diffusion training (not used in EDISCO)"""
-        edge_index = None
-        if not self.sparse:
-            _, points, adj_matrix, _ = batch
-            t = np.random.randint(1, self.diffusion.T + 1, points.shape[0]).astype(int)
-        else:
-            _, graph_data, point_indicator, edge_indicator, _ = batch
-            t = np.random.randint(1, self.diffusion.T + 1, point_indicator.shape[0]).astype(int)
-            route_edge_flags = graph_data.edge_attr
-            points = graph_data.x
-            edge_index = graph_data.edge_index
-            num_edges = edge_index.shape[1]
-            batch_size = point_indicator.shape[0]
-            adj_matrix = route_edge_flags.reshape((batch_size, num_edges // batch_size))
-        
-        # Sample from diffusion
-        adj_matrix_norm = adj_matrix * 2.0 - 1.0
-        
-        if not self.sparse:
-            adj_matrix_norm = adj_matrix_norm.unsqueeze(1).unsqueeze(1)
-            xt, noise = self.diffusion.sample(adj_matrix_norm, t)
-            pred = self.model(points, xt, t, edge_index)
-            pred = pred.squeeze(1)
-        else:
-            adj_matrix_norm = adj_matrix_norm.reshape(-1).unsqueeze(-1)
-            xt, noise = self.diffusion.sample(adj_matrix_norm, t)
-            points = points.repeat(batch_size, 1)
-            t = t.repeat_interleave(edge_indicator.reshape(-1).cpu(), dim=0).numpy()
-            xt = xt.reshape((batch_size * edge_indicator[-1], 1))
-            noise = noise.reshape((batch_size * edge_indicator[-1], 1))
-            pred = self.model(points, xt, t, edge_index).squeeze(-1)
-        
-        loss = F.mse_loss(pred, noise.squeeze())
-        self.log("train/loss", loss, prog_bar=True)
-        return loss
-    
+            adj_matrix = graph_data.edge_attr.reshape(batch_size, -1).float()
+            return graph_data.x, adj_matrix, graph_data.edge_index, graph_data.batch
+        _, coords, adj_matrix, _ = batch
+        return coords, adj_matrix, None, None
+
+    def _predict_x0_logits(self, coords, xt, t, edge_index):
+        """Clean-edge logits with a leading batch dimension."""
+        if edge_index is None:
+            return self.forward(coords, xt, t, None)
+        batch_size, edges_per_graph = xt.shape
+        logits = self.forward(coords, xt.reshape(-1),
+                              t.repeat_interleave(edges_per_graph), edge_index)
+        return logits.reshape(batch_size, edges_per_graph, 2)
+
     def training_step(self, batch, batch_idx):
-        if self.diffusion_type == 'gaussian':
-            return self.gaussian_training_step(batch, batch_idx)
-        elif self.diffusion_type == 'categorical':
-            return self.categorical_training_step(batch, batch_idx)
-    
+        coords, adj_matrix, edge_index, node_batch = self._unpack_batch(batch)
+        batch_size = adj_matrix.shape[0]
+
+        if self.data_augmentation == 'e2':
+            coords = random_e2_transform(coords, node_batch)
+
+        # t ~ U(0, 1), X_t ~ q(X_t | X_0)
+        t = torch.rand(batch_size, device=coords.device)
+        xt = self.diffusion.sample_forward(adj_matrix, t)
+
+        # x0 prediction and (1 - sqrt(t))-weighted cross-entropy
+        x0_pred_logits = self._predict_x0_logits(coords, xt, t, edge_index)
+        loss = self.diffusion.loss(adj_matrix, t, x0_pred_logits)
+
+        if self.symmetry_loss:
+            # Soft regularizer: predictions on a transformed copy of the
+            # instance should match those on the original coordinates.
+            coords_g = random_e2_transform(coords, node_batch)
+            logits_g = self._predict_x0_logits(coords_g, xt, t, edge_index)
+            sym_loss = (F.softmax(x0_pred_logits, dim=-1)[..., 1]
+                        - F.softmax(logits_g, dim=-1)[..., 1]).pow(2).mean()
+            self.log("train/symmetry_loss", sym_loss, batch_size=batch_size)
+            loss = loss + self.symmetry_loss_weight * sym_loss
+
+        self.log("train/loss", loss, prog_bar=True, batch_size=batch_size)
+        return loss
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def sample_heatmap(self, coords, edge_index=None, n_steps=None):
+        """Run the reverse CTMC and return the final clean-edge probabilities.
+
+        Args:
+            coords: (B, n, 2) for dense graphs, (n, 2) for one sparse graph
+            edge_index: (2, E) for sparse graphs
+        Returns:
+            (B, n, n) probabilities for dense graphs, (E,) for a sparse graph
+        """
+        device = coords.device
+        if edge_index is None:
+            if coords.dim() == 2:
+                coords = coords.unsqueeze(0)
+            batch_size, n_nodes, _ = coords.shape
+            shape = (batch_size, n_nodes, n_nodes)
+        else:
+            coords = coords.reshape(-1, coords.shape[-1])
+            shape = (edge_index.shape[1],)
+
+        def score_fn(x, t):
+            return self.model(coords, x, torch.full((1,), float(t), device=device), edge_index)
+
+        # X_{t_0} ~ Uniform({0, 1})
+        x_T = torch.randint(0, 2, shape, device=device, dtype=torch.float32)
+        return self.build_solver(num_steps=n_steps).sample(
+            score_fn, x_T, schedule=self.args.time_schedule)
+
+    def sample_with_solver(self, coords, n_steps=None, edge_index=None):
+        """Sample tours: reverse diffusion followed by one decoder call."""
+        heatmap = self.sample_heatmap(coords, edge_index if self.sparse else None, n_steps)
+        decoder = getattr(self.args, 'decoder', 'nee')
+        if self.sparse:
+            points = coords.reshape(-1, coords.shape[-1]).cpu().numpy()
+            tours, _ = decode_tsp_batch(heatmap.cpu().numpy().reshape(1, -1), points,
+                                        edge_index.cpu().numpy(), True, 1, decoder)
+        else:
+            points = coords if coords.dim() == 3 else coords.unsqueeze(0)
+            tours, _ = decode_tsp_batch(heatmap.cpu().numpy(), points.cpu().numpy(),
+                                        None, False, 1, decoder)
+        return tours, heatmap
+
+    def _refine(self, points, tour, device):
+        """Optional 2-opt local search (reference comparisons only)."""
+        if self.args.two_opt_iterations <= 0:
+            return tour
+        refined, _ = batched_two_opt_torch(
+            points.astype("float64"), np.array([tour], dtype='int64'),
+            max_iterations=self.args.two_opt_iterations, device=device)
+        return refined[0]
+
     def test_step(self, batch, batch_idx, split='test'):
-        """Test step compatible with both DIFUSCO and EDISCO"""
-        device = batch[-1].device if isinstance(batch[-1], torch.Tensor) else batch[0].device
-        
-        if not self.sparse:
-            real_batch_idx, points, adj_matrix, gt_tour = batch
-            np_points = points.cpu().numpy()[0]
-            np_gt_tour = gt_tour.cpu().numpy()[0]
-            np_edge_index = None
-        else:
-            real_batch_idx, graph_data, point_indicator, edge_indicator, gt_tour = batch
-            points = graph_data.x
-            np_points = points.cpu().numpy()
-            np_gt_tour = gt_tour.cpu().numpy().reshape(-1)
-            edge_index = graph_data.edge_index
-            np_edge_index = edge_index.cpu().numpy()
-        
-        # Sample using appropriate method
-        if self.is_continuous:
-            tours, merge_iterations = self._sample_continuous(
-                points, device, edge_index if self.sparse else None, np_edge_index
-            )
-        else:
-            tours, merge_iterations = self._sample_discrete(
-                points, device, edge_index if self.sparse else None, np_edge_index,
-                point_indicator if self.sparse else None,
-                edge_indicator if self.sparse else None
-            )
-        
-        # Apply 2-opt refinement
-        solved_tours, ns = batched_two_opt_torch(
-            np_points.astype("float64"), 
-            np.array(tours).astype('int64'),
-            max_iterations=self.args.two_opt_iterations, 
-            device=device
-        )
-        
-        # Evaluate
-        tsp_solver = TSPEvaluator(np_points)
-        gt_cost = tsp_solver.evaluate(np_gt_tour)
-        
-        total_sampling = self.args.parallel_sampling * self.args.sequential_sampling
-        all_solved_costs = [tsp_solver.evaluate(solved_tours[i]) for i in range(min(total_sampling, len(solved_tours)))]
-        best_solved_cost = np.min(all_solved_costs)
-        
+        if self.sparse:
+            return self._test_step_sparse(batch, batch_idx, split)
+        return self._test_step_dense(batch, batch_idx, split)
+
+    def _test_step_dense(self, batch, batch_idx, split='test'):
+        """Evaluate every dense instance, retaining the best sampled candidate."""
+        _, coords, adj_matrix, gt_tour = batch
+        device, batch_size = coords.device, coords.shape[0]
+        parallel = max(1, getattr(self.args, 'parallel_sampling', 1))
+        sequential = max(1, getattr(self.args, 'sequential_sampling', 1))
+        points, gt = coords.cpu().numpy(), gt_tour.cpu().numpy()
+        evaluators = [TSPEvaluator(p) for p in points]
+        gt_costs = np.array([e.evaluate(t) for e, t in zip(evaluators, gt)])
+        best = np.full(batch_size, np.inf)
+        start = self.wall_clock()
+        for _ in range(sequential):
+            tours, _ = self.sample_with_solver(coords.repeat_interleave(parallel, dim=0))
+            for b, evaluator in enumerate(evaluators):
+                for k in range(parallel):
+                    tour = self._refine(points[b], tours[b * parallel + k], device)
+                    best[b] = min(best[b], evaluator.evaluate(tour))
+        elapsed = self.wall_clock() - start
+        metrics = {
+            f"{split}/gt_cost": float(gt_costs.mean()),
+            f"{split}/solved_cost": float(best.mean()),
+            f"{split}/gap": float(((best - gt_costs) / gt_costs * 100).mean()),
+            # sampling, decoding and optional local search, per instance
+            f"{split}/time": elapsed / batch_size,
+        }
+        if split == 'test' and getattr(self.args, 'test_equivariance', False):
+            metrics[f"{split}/consistency_max_abs_dp"] = self.consistency_probe(coords, adj_matrix)
+        for key, value in metrics.items():
+            self.log(key, value, on_epoch=True, sync_dist=True, batch_size=batch_size)
+        return metrics
+
+    def _test_step_sparse(self, batch, batch_idx, split='test'):
+        """Evaluate one sparse instance, retaining the best sampled candidate."""
+        _, graph_data, point_indicator, _, gt_tour = batch
+        if point_indicator.numel() != 1:
+            raise ValueError('Sparse evaluation requires batch_size=1 to keep instances separate')
+        coords = graph_data.x.reshape(-1, 2)
+        edge_index = graph_data.edge_index
+        device = coords.device
+        points = coords.cpu().numpy()
+        samples = (max(1, getattr(self.args, 'parallel_sampling', 1))
+                   * max(1, getattr(self.args, 'sequential_sampling', 1)))
+
+        evaluator = TSPEvaluator(points)
+        gt_cost = evaluator.evaluate(gt_tour.cpu().numpy().reshape(-1))
+        best = np.inf
+        start = self.wall_clock()
+        for _ in range(samples):
+            tours, _ = self.sample_with_solver(coords, edge_index=edge_index)
+            best = min(best, evaluator.evaluate(self._refine(points, tours[0], device)))
+        elapsed = self.wall_clock() - start
+
         metrics = {
             f"{split}/gt_cost": gt_cost,
-            f"{split}/2opt_iterations": ns,
-            f"{split}/merge_iterations": merge_iterations,
+            f"{split}/solved_cost": best,
+            f"{split}/gap": (best - gt_cost) / gt_cost * 100,
+            f"{split}/time": elapsed,
         }
         for k, v in metrics.items():
-            self.log(k, v, on_epoch=True, sync_dist=True)
-        self.log(f"{split}/solved_cost", best_solved_cost, prog_bar=True, on_epoch=True, sync_dist=True)
+            self.log(k, v, on_epoch=True, sync_dist=True, batch_size=1)
         return metrics
-    
-    def _sample_continuous(self, points, device, edge_index, np_edge_index):
-        """Continuous-time sampling using ODE solver (for EDISCO)"""
-        from utils.ode_solvers import get_solver
-        from models.continuous_score_network import ScoreWrapper
-        
-        batch_size = 1 if len(points.shape) == 2 else points.shape[0]
-        n_nodes = points.shape[-2] if len(points.shape) == 3 else points.shape[0]
-        
-        # Initialize at t=1 with noise
-        if not self.sparse:
-            x_T = torch.randint(0, 2, (batch_size, n_nodes, n_nodes), 
-                              device=device, dtype=torch.float32)
-        else:
-            n_edges = edge_index.shape[1] if edge_index is not None else n_nodes * (n_nodes - 1)
-            x_T = torch.randint(0, 2, (n_edges,), device=device, dtype=torch.float32)
-        
-        # Get solver with beta parameters for consistent CTMC posterior
-        beta_min = getattr(self.args, 'beta_min', 0.1)
-        beta_max = getattr(self.args, 'beta_max', 1.5)
-        solver = get_solver(
-            self.args.solver_type if hasattr(self.args, 'solver_type') else 'pndm',
-            self.args.solver_steps if hasattr(self.args, 'solver_steps') else 50,
-            beta_min=beta_min, beta_max=beta_max
-        )
-        
-        # Create score function wrapper
-        if len(points.shape) == 2:
-            points = points.unsqueeze(0)
-        score_fn = ScoreWrapper(self.model, points, edge_index)
-        
-        # Sample
-        x0_pred = solver.sample(
-            score_fn, x_T, device=device,
-            schedule=getattr(self.args, 'time_schedule', 'linear'),
-            adaptive_mixing=getattr(self.args, 'adaptive_mixing', True),
-            deterministic_threshold=getattr(self.args, 'deterministic_threshold', 0.1)
-        )
-        
-        # Convert to adjacency matrix
-        adj_mat = x0_pred.cpu().detach().numpy()
-        
-        # Extract tours
-        tours, merge_iterations = merge_tours(
-            adj_mat, 
-            points.cpu().numpy()[0] if batch_size == 1 else points.cpu().numpy(),
-            np_edge_index,
-            sparse_graph=self.sparse,
-            parallel_sampling=self.args.parallel_sampling,
-        )
-        
-        return tours, merge_iterations
-    
-    def _sample_discrete(self, points, device, edge_index, np_edge_index, 
-                        point_indicator, edge_indicator):
-        """Discrete-time sampling (original DIFUSCO)"""
-        # Implementation of original discrete sampling
-        # (This would be the existing DIFUSCO sampling code)
-        
-        stacked_tours = []
-        for _ in range(self.args.sequential_sampling):
-            # Initialize noise
-            if self.diffusion_type == 'gaussian':
-                if not self.sparse:
-                    xt = torch.randn(points.shape[0], 1, points.shape[1], points.shape[1]).to(device)
-                else:
-                    xt = torch.randn(self.args.parallel_sampling * edge_index.shape[1], 1).to(device)
-            else:
-                if not self.sparse:
-                    xt = torch.randint(0, 2, (points.shape[0], points.shape[1], points.shape[1])).to(device)
-                else:
-                    xt = torch.randint(0, 2, (self.args.parallel_sampling * edge_index.shape[1],)).to(device)
-            
-            # Inference schedule
-            schedule = InferenceSchedule(self.args.inference_schedule, self.diffusion.T, 
-                                        self.args.inference_diffusion_steps)
-            
-            # Denoise
-            for i in range(self.args.inference_diffusion_steps):
-                t1, t2 = schedule[i]
-                
-                if self.diffusion_type == 'gaussian':
-                    xt = self.gaussian_denoise_step(points, xt, t1, device, edge_index, target_t=t2)
-                else:
-                    xt = self.categorical_denoise_step(points, xt, t1, device, edge_index, 
-                                                       point_indicator, edge_indicator, target_t=t2)
-            
-            # Convert to adjacency matrix
-            if self.diffusion_type == 'gaussian':
-                adj_mat = xt.cpu().detach().numpy() * 0.5 + 0.5
-            else:
-                adj_mat = xt.float().cpu().detach().numpy() + 1e-6
-            
-            # Extract tours
-            tours, merge_iterations = merge_tours(
-                adj_mat, points.cpu().numpy(), np_edge_index,
-                sparse_graph=self.sparse,
-                parallel_sampling=self.args.parallel_sampling,
-            )
-            stacked_tours.append(tours)
-        
-        return np.concatenate(stacked_tours, axis=0), merge_iterations
-    
-    def gaussian_denoise_step(self, points, xt, t, device, edge_index, target_t=None):
-        """Gaussian denoising step"""
-        # Implementation from original DIFUSCO
-        pass
-    
-    def categorical_denoise_step(self, points, xt, t, device, edge_index, 
-                                point_indicator=None, edge_indicator=None, target_t=None):
-        """Categorical denoising step"""
-        # Implementation from original DIFUSCO
-        pass
-    
-    def validation_step(self, batch, batch_idx):
-        return self.test_step(batch, batch_idx, split='val')
+
+    # ------------------------------------------------------------------
+    # Edge-probability consistency probe
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def consistency_probe(self, coords, adj_matrix):
+        """Mean over instances and random g of max_ij |P_ij(x) - P_ij(g x)|.
+
+        The noisy edge state and the diffusion time are held fixed while the
+        coordinates are transformed by random elements of E(2).
+        """
+        num_g = getattr(self.args, 'equivariance_probe_samples', 16)
+        batch_size = coords.shape[0]
+        t = torch.rand(batch_size, device=coords.device)
+        xt = self.diffusion.sample_forward(adj_matrix, t)
+        reference = F.softmax(self.forward(coords, xt, t, None), dim=-1)[..., 1]
+        deltas = []
+        for _ in range(num_g):
+            transformed = F.softmax(self.forward(random_e2_transform(coords), xt, t, None), dim=-1)[..., 1]
+            deltas.append((reference - transformed).abs().reshape(batch_size, -1).max(dim=1).values)
+        return float(torch.stack(deltas).mean())

@@ -1,10 +1,34 @@
-"""TSP (Traveling Salesman Problem) Graph Dataset"""
+"""TSP dataset (dense graphs or kNN-sparsified graphs)."""
 
 import numpy as np
 import torch
 
 from sklearn.neighbors import KDTree
 from torch_geometric.data import Data as GraphData
+
+
+def knn_indices(points, k, margin=8):
+  """k nearest neighbours of every point, ties broken by lower node index.
+
+  Neighbours are ordered by (distance, node index), so the neighbour sets
+  depend only on pairwise distances and node indices. Each point is its own
+  nearest neighbour (distance zero), following the DIFUSCO sparsification.
+  """
+  n = points.shape[0]
+  k = min(k, n)
+  k_query = min(n, k + margin)
+  dist, idx = KDTree(points, leaf_size=30, metric='euclidean').query(
+      points, k=k_query, return_distance=True)
+  order = np.lexsort((idx, dist), axis=-1)
+  dist = np.take_along_axis(dist, order, axis=-1)
+  idx = np.take_along_axis(idx, order, axis=-1)
+  if k_query < n:
+    # A tie that reaches the end of the query window may hide equidistant
+    # points with lower indices, so those rows are resolved exhaustively.
+    for i in np.nonzero(dist[:, k - 1] == dist[:, -1])[0]:
+      d = np.linalg.norm(points - points[i], axis=-1)
+      idx[i, :k] = np.lexsort((np.arange(n), d))[:k]
+  return idx[:, :k]
 
 
 class TSPGraphDataset(torch.utils.data.Dataset):
@@ -52,9 +76,8 @@ class TSPGraphDataset(torch.utils.data.Dataset):
     else:
       # Return a sparse graph where each node is connected to its k nearest neighbors
       # k = self.sparse_factor
-      sparse_factor = self.sparse_factor
-      kdt = KDTree(points, leaf_size=30, metric='euclidean')
-      dis_knn, idx_knn = kdt.query(points, k=sparse_factor, return_distance=True)
+      sparse_factor = min(self.sparse_factor, points.shape[0])
+      idx_knn = knn_indices(points, sparse_factor)
 
       edge_index_0 = torch.arange(points.shape[0]).reshape((-1, 1)).repeat(1, sparse_factor).reshape(-1)
       edge_index_1 = torch.from_numpy(idx_knn.reshape(-1))

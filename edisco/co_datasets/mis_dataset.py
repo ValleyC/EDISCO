@@ -1,4 +1,4 @@
-"""MIS (Maximum Independent Set) dataset for EDISCO."""
+"""Maximum independent set dataset."""
 
 import glob
 import os
@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch_geometric.data import Data as GraphData
 
-# Try to import pickle5 for Python 3.7 compatibility, fallback to pickle
+# pickle5 reads protocol-5 pickles under Python 3.7
 try:
     import pickle5 as pickle
 except ImportError:
@@ -17,7 +17,10 @@ except ImportError:
 class MISDataset(torch.utils.data.Dataset):
     """Dataset for Maximum Independent Set problem.
 
-    Loads graphs from .gpickle files with optional external labels.
+    Loads graphs from .gpickle files with optional external labels, or from a
+    text file with one graph per line in the format
+    `u1 v1 u2 v2 ... label l_0 l_1 ... l_{n-1}` (edge list followed by the
+    binary node labels).
     Each graph instance contains:
         - Node labels (binary: 0=not in MIS, 1=in MIS)
         - Edge indices (undirected, with self-loops)
@@ -30,7 +33,12 @@ class MISDataset(torch.utils.data.Dataset):
             data_label_dir: Optional directory containing external label files
         """
         self.data_file = data_file
-        self.file_lines = glob.glob(data_file)
+        self.text_format = data_file.endswith('.txt')
+        if self.text_format:
+            with open(data_file) as f:
+                self.file_lines = f.read().splitlines()
+        else:
+            self.file_lines = sorted(glob.glob(data_file))
         self.data_label_dir = data_label_dir
         print(f'Loaded "{data_file}" with {len(self.file_lines)} examples')
 
@@ -45,6 +53,18 @@ class MISDataset(torch.utils.data.Dataset):
             node_labels: Binary labels for each node (1 if in MIS)
             edges: Edge index array (2, num_edges) with bidirectional edges and self-loops
         """
+        if self.text_format:
+            edge_part, label_part = self.file_lines[idx].split(' label ')
+            node_labels = np.array(label_part.split(), dtype=np.int64)
+            num_nodes = node_labels.shape[0]
+            pairs = np.array(edge_part.split(), dtype=np.int64).reshape(-1, 2)
+            # unique undirected edges without self-loops
+            pairs = np.sort(pairs[pairs[:, 0] != pairs[:, 1]], axis=1)
+            pairs = np.unique(pairs, axis=0)
+            self_loop = np.arange(num_nodes).reshape(-1, 1).repeat(2, axis=1)
+            edges = np.concatenate([pairs, pairs[:, ::-1], self_loop], axis=0).T
+            return num_nodes, node_labels, edges
+
         with open(self.file_lines[idx], "rb") as f:
             graph = pickle.load(f)
 

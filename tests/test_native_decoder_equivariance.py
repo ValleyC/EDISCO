@@ -1,4 +1,4 @@
-"""Equivariance unit tests for the native edge-expansion decoder (T1.4-code).
+"""Equivariance tests for the native edge-expansion decoder.
 
 For every E(2) transformation `g` of the coordinates, the decoder must produce
 the same selected edge set in node-index space. Distances are E(2)-invariant

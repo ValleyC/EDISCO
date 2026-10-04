@@ -1,3 +1,10 @@
+"""Anisotropic graph neural network with edge gating (Joshi et al., 2019).
+
+This is the non-equivariant encoder of DIFUSCO (Sun & Yang, 2023). EDISCO uses
+it as the score network for MIS, which has no geometric structure, and as the
+non-equivariant baseline of the encoder ablation.
+"""
+
 import functools
 import math
 

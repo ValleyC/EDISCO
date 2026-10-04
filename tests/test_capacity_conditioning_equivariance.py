@@ -1,4 +1,4 @@
-"""Equivariance unit tests for the capacity-conditioned EGNN encoder (T1.3-code).
+"""Equivariance tests for the capacity-conditioned EGNN encoder.
 
 For every fixed value of `(demands, capacity)`, the conditional encoder must
 produce the same edge logits when coordinates are translated, rotated, or
@@ -22,8 +22,8 @@ EDISCO_PKG = os.path.join(EDISCO_ROOT, "edisco")
 if EDISCO_PKG not in sys.path:
     sys.path.insert(0, EDISCO_PKG)
 
-from models.egnn_encoder_cvrp_conditional import (  # noqa: E402
-    EGNNEncoderCVRPConditional,
+from models.egnn_encoder_cvrp import (  # noqa: E402
+    EGNNEncoderCVRP,
     build_invariant_capacity_features,
 )
 from utils.equivariance_utils import (  # noqa: E402
@@ -47,7 +47,7 @@ class CapacityConditioningEquivarianceTests(unittest.TestCase):
         self.invariant_dim = 2  # mimicking [demand, is_depot]
         self.default_capacity = 1.0
 
-        self.model = EGNNEncoderCVRPConditional(
+        self.model = EGNNEncoderCVRP(
             n_layers=3,
             hidden_dim=32,
             node_dim=24,
